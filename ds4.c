@@ -73774,7 +73774,7 @@ static float qwen35_shared_expert_gate(float dot) {
 typedef struct {
     /* f32 weights, row-major: element (out, in) is weight[out * in_dim + in].
      * This mirrors the GGUF [in_dim, out_dim] layout the engine reads. */
-    const float *attn_q;       /* [2*q_dim][n_embd] query then gate */
+    const float *attn_q;       /* [2*q_dim][n_embd] per-head interleaved query+gate */
     const float *attn_k;       /* [kv_dim][n_embd] */
     const float *attn_v;       /* [kv_dim][n_embd] */
     const float *attn_output;  /* [n_embd][q_dim] */
@@ -73794,11 +73794,12 @@ typedef struct {
 } ds4_test_qwen35_attn_args;
 
 /* The qwen35moe full-attention CPU layer: pre-attention RMSNorm, double-width
- * attn_q (query then sigmoid output gate), GQA k/v, per-head q/k RMSNorm,
- * plain partial RoPE over the tail n_rot of each head, causal softmax, the
- * sigmoid gate on the attention output, the output projection, the residual
- * and the post-attention RMSNorm.  Run the engine's own f32 matvec by wrapping
- * the explicit pointer in a synthetic 2D tensor. */
+ * attn_q whose per-head query and sigmoid output gate are interleaved, GQA k/v,
+ * per-head q/k RMSNorm, partial Neox-half-pair RoPE over the first n_rot dims of
+ * each head, causal softmax, the sigmoid gate on the attention output, the
+ * output projection, the residual and the post-attention RMSNorm.  Run the
+ * engine's own f32 matvec by wrapping the explicit pointer in a synthetic 2D
+ * tensor. */
 static void qwen35_attn_matvec_f32(
         float          * out,
         const float    * weight,
@@ -74172,8 +74173,16 @@ int ds4_test_qwen35_moe_forward(const ds4_test_qwen35_moe_weights *w,
         for (uint64_t j = 0; j < n_ff_exp; j++)
             h[j] = silu(gate[j]) * up[j];
         qwen35_moe_matvec_f32(y, down_e, n_ff_exp, n_embd, h);
+        /* Qwen3.5 renormalises the top-k router weights instead of scaling them
+         * (transformers Qwen3_5MoeTopKRouter), but llama.cpp still multiplies
+         * the renormalised weight by expert_weights_scale
+         * (build_moe_ffn(cur, ..., norm_w=true, scale=expert_weights_scale)).
+         * The Ornith GGUF carries no qwen35moe.expert_weights_scale key, so
+         * DS4_EXPERT_WEIGHT_SCALE is 1.0 here and this is a no-op today; it is
+         * applied explicitly so a future non-1.0 preset is honoured. */
+        const float moe_scale = DS4_EXPERT_WEIGHT_SCALE;
         for (uint64_t d = 0; d < n_embd; d++)
-            out[d] += weights[k] * y[d];
+            out[d] += (weights[k] * moe_scale) * y[d];
     }
 
     /* Shared expert: h_s = silu(gate_s . x) * (up_s . x); y_s = down_s . h_s;
@@ -74559,6 +74568,45 @@ static void qwen35_embed_row(const ds4_model *m, const ds4_tensor *emb,
     qwen35_dequant_row(emb, base + (uint64_t)token * qwen35_row_bytes(emb), dst);
 }
 
+/* Falsifier switch for the step-0 match (spec: "Shown to fail").  When
+ * DS4_QWEN35_PERTURB_LAYER names a layer index, that layer's residual output is
+ * perturbed so the end-to-end greedy match must break; unset in every real run.
+ * Returns -1 when unset or malformed. */
+static int qwen35_perturb_layer(void) {
+    const char *s = getenv("DS4_QWEN35_PERTURB_LAYER");
+    if (!s || !s[0]) return -1;
+    return atoi(s);
+}
+
+/* Perturbation strength for the falsifier: hidden = hidden * f + f, read from
+ * DS4_QWEN35_PERTURB_FACTOR (default 2.0). */
+static float qwen35_perturb_factor(void) {
+    const char *s = getenv("DS4_QWEN35_PERTURB_FACTOR");
+    if (!s || !s[0]) return 2.0f;
+    return strtof(s, NULL);
+}
+
+/* Fast-math-safe finite test.  This TU is built with -ffast-math, which implies
+ * -ffinite-math-only: the compiler then folds isfinite(), (x != x) and even a
+ * by-value bit inspection of a NaN it can see produced, all to "finite".  The
+ * test therefore reads the exponent bits through a pointer into the logits
+ * buffer, which GCC does not constant-fold.  IEEE-754 binary32 is non-finite
+ * (NaN or +-Inf) iff its exponent field is all ones. */
+static int qwen35_is_finite(const float *p) {
+    uint32_t bits;
+    memcpy(&bits, (const void *)p, sizeof(bits));
+    return (bits & 0x7f800000u) != 0x7f800000u;
+}
+
+/* Test-only forcing function for the finite gate: DS4_QWEN35_NAN_LOGIT=<index>
+ * writes a quiet NaN there so the gate is seen to fire.  Unset in every real
+ * run.  Returns -1 when unset or malformed. */
+static int qwen35_nan_logit(void) {
+    const char *s = getenv("DS4_QWEN35_NAN_LOGIT");
+    if (!s || !s[0]) return -1;
+    return atoi(s);
+}
+
 /* One causal prefill over `seq[0..len)`; writes step logits for the last
  * position and its greedy token.  The four [cap][n_embd] scratch rows are the
  * caller's. */
@@ -74664,6 +74712,14 @@ static int qwen35_forward_prefill(
             const uint64_t off = (uint64_t)t * ne;
             for (uint32_t d = 0; d < ne; d++) hidden[off + d] = worked[off + d] + moe_buf[d];
         }
+        if ((int)il == qwen35_perturb_layer()) {
+            const float pf = qwen35_perturb_factor();
+            for (uint32_t t = 0; t < len; t++) {
+                const uint64_t off = (uint64_t)t * ne;
+                for (uint32_t d = 0; d < ne; d++)
+                    hidden[off + d] = hidden[off + d] * pf + pf;
+            }
+        }
         free((void *)mw.ffn_gate_inp);       free((void *)mw.ffn_gate_exps);
         free((void *)mw.ffn_up_exps);        free((void *)mw.ffn_down_exps);
         free((void *)mw.ffn_gate_inp_shexp); free((void *)mw.ffn_gate_shexp);
@@ -74678,6 +74734,21 @@ static int qwen35_forward_prefill(
     qwen35_attn_matvec_f32(logits_out, ow, ne, n_vocab, fin);
     free(ow);
     free(fin);
+
+    {
+        const int nl = qwen35_nan_logit();
+        if (nl >= 0 && (uint32_t)nl < n_vocab) {
+            const uint32_t nan_bits = 0x7fc00000u;  /* quiet NaN */
+            memcpy(&logits_out[nl], &nan_bits, sizeof(nan_bits));
+        }
+    }
+
+    /* Finite/NaN gate: greedy selection and any later value comparison are
+     * meaningless on a NaN/Inf row (spec verification bullet: finite/plausible
+     * logits before any value comparison). */
+    for (uint32_t v = 0; v < n_vocab; v++) {
+        if (!qwen35_is_finite(&logits_out[v])) return 1;
+    }
 
     uint32_t best = 0;
     float bestv = logits_out[0];

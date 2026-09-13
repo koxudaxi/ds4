@@ -9,10 +9,11 @@
  * and not the quantizer.
  *
  * The reference below is a plain scalar implementation of the same math:
- * pre-attention RMSNorm, q/k/v projections (attn_q is double width: query then
- * sigmoid output gate), per-head q/k RMSNorm, plain partial RoPE over the tail
- * n_rot of each head, GQA grouping (n_head query heads share n_head_kv KV heads
- * by h / (n_head / n_head_kv)), a causal softmax over key_pos <= query_pos, the
+ * pre-attention RMSNorm, q/k/v projections (attn_q is double width with each
+ * head's query and sigmoid output gate interleaved), per-head q/k RMSNorm,
+ * partial Neox-half-pair RoPE over the first n_rot dims of each head, GQA
+ * grouping (n_head query heads share n_head_kv KV heads by
+ * h / (n_head / n_head_kv)), a causal softmax over key_pos <= query_pos, the
  * sigmoid gate applied to the attention output, the output projection, the
  * attention residual and the post-attention RMSNorm.  Each of the three Task 2
  * pieces also has a sensitivity assertion that removing it changes the output,
@@ -62,7 +63,7 @@ typedef struct {
     float       *out;          /* [n_tokens][N_EMBD] */
     uint32_t     n_tokens;
     uint32_t     il;
-    uint32_t     n_rot;        /* partial-RoPE tail, 0 disables */
+    uint32_t     n_rot;        /* partial-RoPE front width, 0 disables */
     uint32_t     pos0;         /* position of the first token */
     float        rope_freq_base;
 } ds4_test_qwen35_attn_args;
@@ -239,8 +240,9 @@ static void reference_layer(const float *wq, const float *wk, const float *wv,
         }
     }
 
-    /* Sigmoid output gate: the second half of attn_q multiplies the attention
-     * output elementwise before the output projection. */
+    /* Sigmoid output gate: per head, the second head_dim block of the
+     * interleaved attn_q projection multiplies that head's attention output
+     * elementwise before the output projection. */
     if (cfg->apply_gate) {
         for (uint32_t t = 0; t < n_tokens; t++) {
             const float *qt = q + (uint64_t)t * Q_GATE_DIM;

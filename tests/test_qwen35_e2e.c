@@ -26,6 +26,18 @@ int ds4_test_qwen35_forward_logits(const char *gguf, const uint32_t *tokens,
                                    float *logits_out, uint32_t *greedy_out);
 
 #define VOCAB_MAX 300000u
+/* DS4_SHAPE_ORNITH15 n_vocab.  The hook writes exactly this many logits. */
+#define ORNITH_N_VOCAB 248320u
+
+/* Fast-math-safe finite test.  This unit is built with -ffast-math
+ * (-ffinite-math-only), which lets the compiler fold isfinite() and by-value
+ * bit inspection to true, so read the IEEE-754 binary32 exponent bits through
+ * a pointer into the logits buffer. */
+static int is_finite_logit(const float *p) {
+    uint32_t bits;
+    memcpy(&bits, (const void *)p, sizeof(bits));
+    return (bits & 0x7f800000u) != 0x7f800000u;
+}
 
 static char *read_file(const char *path, long *len_out) {
     FILE *fp = fopen(path, "rb");
@@ -148,6 +160,16 @@ int main(int argc, char **argv) {
         fprintf(stderr, "forward failed: rc=%d\n", rc);
         free(logits);
         return 1;
+    }
+
+    /* Finite gate before any value comparison (spec verification bullet). */
+    for (uint32_t v = 0; v < ORNITH_N_VOCAB; v++) {
+        if (!is_finite_logit(&logits[v])) {
+            fprintf(stderr, "FAIL: %s logit %u is not finite (%g)\n",
+                    case_id, v, logits[v]);
+            free(logits);
+            return 1;
+        }
     }
 
     printf("step-0 greedy token: %u (reference %u)\n", greedy, expected);
