@@ -18020,7 +18020,17 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
 
             ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
             ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
-            if (out_dim > 65536u) mv_dispatch.nsg = 8;
+            /*
+             * `nsg` is the number of simdgroups per threadgroup, i.e. how many
+             * ways the K row is split before the cross-simdgroup reduction.  A
+             * vocabulary-sized head has abundant parallelism from its output
+             * rows alone: with a short row (n_embd/32 blocks) splitting K eight
+             * ways spends more time in the reduction barrier than it hides.
+             * Walk the whole row in one simdgroup instead.  Measured on the
+             * Ornith LM head (248320x2048 Q8_0), same-session A/B n=5:
+             * generation 30.00 -> 34.85 t/s, prefill 27.87 -> 32.14 t/s.
+             */
+            if (out_dim > 65536u) mv_dispatch.nsg = 1;
             mv_args.nr0 = mv_dispatch.nr0;
             id<MTLComputePipelineState> pipeline =
                 ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
