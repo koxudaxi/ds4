@@ -74607,9 +74607,36 @@ static int qwen35_nan_logit(void) {
     return atoi(s);
 }
 
+/* Per-layer oracle dump (O4 Task 2.1).  Writes one text row per tensor:
+ * "<name> <n> v0 v1 ..." with %.9g so a comparison script can recompute an
+ * error norm.  `name` is the same node label llama.cpp uses (`attn_norm-<il>`,
+ * `attn_residual-<il>`, `attn_post_norm-<il>`, `l_out-<il>`, `result_norm`,
+ * `result_output`).  Position 0 is always row 0 of the scratch buffer. */
+static void qwen35_dump_vec(FILE *fp, const char *name, const float *v,
+                            uint32_t n) {
+    if (!fp) return;
+    fprintf(fp, "%s %u", name, n);
+    for (uint32_t d = 0; d < n; d++) fprintf(fp, " %.9g", v[d]);
+    fprintf(fp, "\n");
+}
+
+/* Dump a per-position state at both ends of the prefill, so the single-token
+ * (position 0) path and the last-token (logits) path can both be traced. */
+static void qwen35_dump_states(FILE *fp, const char *name,
+                               const float *rows, uint32_t ne, uint32_t len) {
+    if (!fp) return;
+    char nm[64];
+    snprintf(nm, sizeof(nm), "%s#0", name);
+    qwen35_dump_vec(fp, nm, rows, ne);
+    snprintf(nm, sizeof(nm), "%s#L", name);
+    qwen35_dump_vec(fp, nm, rows + (uint64_t)(len - 1u) * ne, ne);
+}
+
 /* One causal prefill over `seq[0..len)`; writes step logits for the last
  * position and its greedy token.  The four [cap][n_embd] scratch rows are the
- * caller's. */
+ * caller's.  When `dump` is non-NULL the prefill's hidden states are written
+ * at each llama.cpp node boundary for the first and last token (test-only
+ * oracle path). */
 static int qwen35_forward_prefill(
         const ds4_model   * m,
         const ds4_weights * w,
@@ -74621,7 +74648,8 @@ static int qwen35_forward_prefill(
         float             * hidden,
         float             * normed,
         float             * worked,
-        float             * post) {
+        float             * post,
+        FILE              * dump) {
     const uint32_t ne = (uint32_t)DS4_N_EMBD;
     const uint32_t n_exec = directional_steering_layer_count();
     const uint32_t n_v = DS4_N_GDN_VALUE_HEAD;
@@ -74632,15 +74660,20 @@ static int qwen35_forward_prefill(
 
     for (uint32_t t = 0; t < len; t++)
         qwen35_embed_row(m, w->token_embd, seq[t], hidden + (uint64_t)t * ne);
+    qwen35_dump_states(dump, "model.input_embed", hidden, ne, len);
 
     float *moe_buf = xmalloc((size_t)ne * sizeof(float));
-
     for (uint32_t il = 0; il < n_exec; il++) {
         const ds4_layer_weights *l = &w->layer[il];
 
         for (uint32_t t = 0; t < len; t++)
             rms_norm_weight(normed + (uint64_t)t * ne, hidden + (uint64_t)t * ne,
                             tensor_data(m, l->attn_norm), ne, DS4_RMS_EPS);
+        {
+            char nm[32];
+            snprintf(nm, sizeof(nm), "attn_norm-%u", il);
+            qwen35_dump_states(dump, nm, normed, ne, len);
+        }
 
         if (!ds4_qwen35moe_layer_is_linear(il)) {
             ds4_test_qwen35_attn_args a;
@@ -74688,6 +74721,13 @@ static int qwen35_forward_prefill(
             rms_norm_weight(post + off, worked + off, tensor_data(m, l->ffn_norm),
                             ne, DS4_RMS_EPS);
         }
+        {
+            char nm[32];
+            snprintf(nm, sizeof(nm), "attn_residual-%u", il);
+            qwen35_dump_states(dump, nm, worked, ne, len);
+            snprintf(nm, sizeof(nm), "attn_post_norm-%u", il);
+            qwen35_dump_states(dump, nm, post, ne, len);
+        }
 
         ds4_test_qwen35_moe_weights mw;
         mw.ffn_gate_inp       = qwen35_dequant_tensor(m, l->ffn_gate_inp);
@@ -74712,6 +74752,11 @@ static int qwen35_forward_prefill(
             const uint64_t off = (uint64_t)t * ne;
             for (uint32_t d = 0; d < ne; d++) hidden[off + d] = worked[off + d] + moe_buf[d];
         }
+        {
+            char nm[32];
+            snprintf(nm, sizeof(nm), "l_out-%u", il);
+            qwen35_dump_states(dump, nm, hidden, ne, len);
+        }
         if ((int)il == qwen35_perturb_layer()) {
             const float pf = qwen35_perturb_factor();
             for (uint32_t t = 0; t < len; t++) {
@@ -74733,6 +74778,8 @@ static int qwen35_forward_prefill(
     float *ow = qwen35_dequant_tensor(m, w->output);
     qwen35_attn_matvec_f32(logits_out, ow, ne, n_vocab, fin);
     free(ow);
+    qwen35_dump_vec(dump, "result_norm#L", fin, ne);
+    qwen35_dump_vec(dump, "result_output#L", logits_out, n_vocab);
     free(fin);
 
     {
@@ -74800,7 +74847,8 @@ static int qwen35_forward_logits_impl(const char *gguf, const uint32_t *tokens,
     for (uint32_t s = 0; s < n_steps; s++) {
         rc = qwen35_forward_prefill(&m, &w, seq, len, n_vocab,
                                     logits_out + (size_t)s * n_vocab,
-                                    &greedy_out[s], hidden, normed, worked, post);
+                                    &greedy_out[s], hidden, normed, worked, post,
+                                    NULL);
         if (rc != 0) break;
         if (s + 1u < n_steps) {
             if (len >= cap) { rc = 1; break; }
@@ -74835,6 +74883,51 @@ int ds4_test_qwen35_forward_logits_ref(const char *gguf, const uint32_t *tokens,
     if (!continuation) return 1;
     return qwen35_forward_logits_impl(gguf, tokens, n_tokens, n_steps,
                                       continuation, logits_out, greedy_out);
+}
+
+/* O4 Task 2.1 per-layer oracle path.  Runs one causal prefill over `tokens`
+ * (no step loop) and writes the hidden state at every llama.cpp node boundary
+ * to `path`, for both the first (#0) and last (#L) token (see qwen35_dump_vec
+ * for the format).  Test-only; no production path calls this and no layer math
+ * differs from the forward. */
+int ds4_test_qwen35_dump_layers(const char *gguf, const uint32_t *tokens,
+                                uint32_t n_tokens, const char *path) {
+    if (!gguf || !tokens || n_tokens == 0 || !path) return 1;
+
+    ds4_model m;
+    memset(&m, 0, sizeof(m));
+    m.fd = -1;
+    ds4_weights w;
+    memset(&w, 0, sizeof(w));
+
+    model_open(&m, gguf, false, false);
+    config_validate_model(&m);
+    weights_bind(&w, &m, false, 0, 0, true, false);
+
+    const uint32_t ne = (uint32_t)DS4_N_EMBD;
+    const uint32_t n_vocab = (uint32_t)DS4_N_VOCAB;
+    float *hidden = xmalloc((size_t)n_tokens * ne * sizeof(float));
+    float *normed = xmalloc((size_t)n_tokens * ne * sizeof(float));
+    float *worked = xmalloc((size_t)n_tokens * ne * sizeof(float));
+    float *post   = xmalloc((size_t)n_tokens * ne * sizeof(float));
+    float *logits = xmalloc((size_t)n_vocab * sizeof(float));
+    uint32_t greedy = 0;
+
+    FILE *fp = fopen(path, "w");
+    int rc = fp ? 0 : 1;
+    if (fp) {
+        rc = qwen35_forward_prefill(&m, &w, tokens, n_tokens, n_vocab, logits,
+                                    &greedy, hidden, normed, worked, post, fp);
+        fclose(fp);
+    }
+
+    free(logits);
+    free(post);
+    free(worked);
+    free(normed);
+    free(hidden);
+    model_close(&m);
+    return rc;
 }
 #endif
 
