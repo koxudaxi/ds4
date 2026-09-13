@@ -74280,9 +74280,19 @@ static void qwen35_gdn_matvec_f32(
     matvec_f32(out, &m, &t, x);
 }
 
+/* Test-only: write one GDN intermediate at the first token (#0) so it can be
+ * compared against llama.cpp's matching graph node.  No arithmetic. */
+static void qwen35_gdn_dump_node(FILE *fp, const char *name,
+                                 const float *v, uint32_t n) {
+    if (!fp) return;
+    fprintf(fp, "%s#0 %u", name, n);
+    for (uint32_t i = 0; i < n; i++) fprintf(fp, " %.9g", v[i]);
+    fprintf(fp, "\n");
+}
+
 int ds4_test_qwen35_gdn_forward(const ds4_test_qwen35_gdn_weights *w,
                                 const float *x, uint32_t n_tokens,
-                                float *state, float *out) {
+                                float *state, float *out, FILE *dump) {
     if (!w || !w->gdn_qkv || !w->gdn_conv1d || !w->gdn_alpha ||
         !w->gdn_beta || !w->gdn_a_log || !w->gdn_dt_bias || !w->gdn_norm ||
         !w->gdn_out || !w->gdn_z || !x || !state || !out || n_tokens == 0) {
@@ -74320,6 +74330,7 @@ int ds4_test_qwen35_gdn_forward(const ds4_test_qwen35_gdn_weights *w,
     float *beta = xmalloc((size_t)n_v * sizeof(float));
     float *alpha = xmalloc((size_t)n_v * sizeof(float));
     float *gate = xmalloc((size_t)n_v * sizeof(float));
+    float *bsig = xmalloc((size_t)n_v * sizeof(float));
     float *qn = xmalloc((size_t)n_v * d_k * sizeof(float));
     float *kn = xmalloc((size_t)n_v * d_k * sizeof(float));
     float *o = xmalloc((size_t)n_v * d_v * sizeof(float));
@@ -74338,6 +74349,13 @@ int ds4_test_qwen35_gdn_forward(const ds4_test_qwen35_gdn_weights *w,
         qwen35_gdn_matvec_f32(beta, w->gdn_beta, n_embd, n_v, xt);
         qwen35_gdn_matvec_f32(alpha, w->gdn_alpha, n_embd, n_v, xt);
 
+        if (t == 0 && dump) {
+            qwen35_gdn_dump_node(dump, "linear_attn_qkv_mixed", qkv, conv_dim);
+            qwen35_gdn_dump_node(dump, "z", z, d_inner);
+            qwen35_gdn_dump_node(dump, "beta", beta, n_v);
+            qwen35_gdn_dump_node(dump, "alpha", alpha, n_v);
+        }
+
         /* Depthwise causal conv over the raw projection, kernel kconv, then
          * silu.  The conv state holds the previous kconv-1 raw rows. */
         for (uint32_t ch = 0; ch < conv_dim; ch++) {
@@ -74350,6 +74368,8 @@ int ds4_test_qwen35_gdn_forward(const ds4_test_qwen35_gdn_weights *w,
             }
             convout[ch] = silu((float)acc);
         }
+        if (t == 0 && dump)
+            qwen35_gdn_dump_node(dump, "conv_output_silu", convout, conv_dim);
         for (uint32_t kk = 0; kk + 1 < kconv - 1; kk++)
             memcpy(conv + (uint64_t)kk * conv_dim,
                    conv + (uint64_t)(kk + 1) * conv_dim,
@@ -74380,6 +74400,12 @@ int ds4_test_qwen35_gdn_forward(const ds4_test_qwen35_gdn_weights *w,
 
         const float *vraw = convout + 2u * n_k * d_k;
 
+        if (t == 0 && dump) {
+            qwen35_gdn_dump_node(dump, "q_conv_predelta", qn, n_v * d_k);
+            qwen35_gdn_dump_node(dump, "k_conv_predelta", kn, n_v * d_k);
+            qwen35_gdn_dump_node(dump, "v_conv_predelta", vraw, n_v * d_v);
+        }
+
         /* The decayed delta-rule recurrence, one [d_v, d_k] state per value
          * head.  ssm_a is the already-folded -exp(A_log) decay coefficient, so
          * gate is the log-decay g = exp(ssm_a * softplus(a+dt)). */
@@ -74388,6 +74414,7 @@ int ds4_test_qwen35_gdn_forward(const ds4_test_qwen35_gdn_weights *w,
                        softplus_stable(alpha[vh] + w->gdn_dt_bias[vh]);
             const float g = expf(gate[vh]);
             const float b = sigmoid_stable(beta[vh]);
+            bsig[vh] = b;
 
             float *s = rec + (uint64_t)vh * d_v * d_k;
             for (uint32_t i = 0; i < d_v * d_k; i++) s[i] *= g;
@@ -74415,6 +74442,12 @@ int ds4_test_qwen35_gdn_forward(const ds4_test_qwen35_gdn_weights *w,
             }
         }
 
+        if (t == 0 && dump) {
+            qwen35_gdn_dump_node(dump, "gate", gate, n_v);
+            qwen35_gdn_dump_node(dump, "beta_sigmoid", bsig, n_v);
+            qwen35_gdn_dump_node(dump, "attn_output", o, n_v * d_v);
+        }
+
         /* Gated RMSNorm: RMSNorm(o, gdn_norm) per value head, then silu(z). */
         for (uint32_t vh = 0; vh < n_v; vh++) {
             double ss = 0.0;
@@ -74428,8 +74461,14 @@ int ds4_test_qwen35_gdn_forward(const ds4_test_qwen35_gdn_weights *w,
             }
         }
 
+        if (t == 0 && dump)
+            qwen35_gdn_dump_node(dump, "final_output", on, n_v * d_v);
+
         qwen35_gdn_matvec_f32(out + (uint64_t)t * n_embd, w->gdn_out, d_inner,
                               n_embd, on);
+        if (t == 0 && dump)
+            qwen35_gdn_dump_node(dump, "linear_attn_out",
+                                 out + (uint64_t)t * n_embd, n_embd);
     }
 
     free(dd);
@@ -74440,6 +74479,7 @@ int ds4_test_qwen35_gdn_forward(const ds4_test_qwen35_gdn_weights *w,
     free(kn);
     free(qn);
     free(gate);
+    free(bsig);
     free(alpha);
     free(beta);
     free(z);
@@ -74663,6 +74703,9 @@ static int qwen35_forward_prefill(
     qwen35_dump_states(dump, "model.input_embed", hidden, ne, len);
 
     float *moe_buf = xmalloc((size_t)ne * sizeof(float));
+    /* Test-only scratch for the FFN sublayer output node (routed + shared,
+     * before the residual add).  NULL in every non-dump run. */
+    float *ffn_dump = dump ? xmalloc((size_t)len * ne * sizeof(float)) : NULL;
     for (uint32_t il = 0; il < n_exec; il++) {
         const ds4_layer_weights *l = &w->layer[il];
 
@@ -74690,7 +74733,7 @@ static int qwen35_forward_prefill(
             free((void *)a.attn_q);       free((void *)a.attn_k);
             free((void *)a.attn_v);       free((void *)a.attn_output);
             free((void *)a.attn_q_norm);  free((void *)a.attn_k_norm);
-            if (rc != 0) { free(moe_buf); return rc; }
+            if (rc != 0) { free(ffn_dump); free(moe_buf); return rc; }
         } else {
             ds4_test_qwen35_gdn_weights g;
             g.gdn_qkv     = qwen35_dequant_tensor(m, l->gdn_qkv);
@@ -74705,14 +74748,15 @@ static int qwen35_forward_prefill(
             const uint64_t state_floats =
                 (uint64_t)n_v * d_v * d_k + (uint64_t)(kconv - 1u) * conv_dim;
             float *state = xcalloc(state_floats, sizeof(float));
-            const int rc = ds4_test_qwen35_gdn_forward(&g, normed, len, state, worked);
+            const int rc = ds4_test_qwen35_gdn_forward(&g, normed, len, state, worked,
+                                                       il == 0u ? dump : NULL);
             free(state);
             free((void *)g.gdn_qkv);     free((void *)g.gdn_conv1d);
             free((void *)g.gdn_alpha);   free((void *)g.gdn_beta);
             free((void *)g.gdn_a_log);   free((void *)g.gdn_dt_bias);
             free((void *)g.gdn_norm);    free((void *)g.gdn_out);
             free((void *)g.gdn_z);
-            if (rc != 0) { free(moe_buf); return rc; }
+            if (rc != 0) { free(ffn_dump); free(moe_buf); return rc; }
         }
 
         for (uint32_t t = 0; t < len; t++) {
@@ -74746,14 +74790,19 @@ static int qwen35_forward_prefill(
                 free((void *)mw.ffn_up_exps);   free((void *)mw.ffn_down_exps);
                 free((void *)mw.ffn_gate_inp_shexp); free((void *)mw.ffn_gate_shexp);
                 free((void *)mw.ffn_up_shexp);  free((void *)mw.ffn_down_shexp);
+                free(ffn_dump);
                 free(moe_buf);
                 return rc;
             }
             const uint64_t off = (uint64_t)t * ne;
             for (uint32_t d = 0; d < ne; d++) hidden[off + d] = worked[off + d] + moe_buf[d];
+            if (ffn_dump)
+                memcpy(ffn_dump + off, moe_buf, (size_t)ne * sizeof(float));
         }
         {
             char nm[32];
+            snprintf(nm, sizeof(nm), "ffn_out-%u", il);
+            qwen35_dump_states(dump, nm, ffn_dump, ne, len);
             snprintf(nm, sizeof(nm), "l_out-%u", il);
             qwen35_dump_states(dump, nm, hidden, ne, len);
         }
@@ -74770,6 +74819,7 @@ static int qwen35_forward_prefill(
         free((void *)mw.ffn_gate_inp_shexp); free((void *)mw.ffn_gate_shexp);
         free((void *)mw.ffn_up_shexp);       free((void *)mw.ffn_down_shexp);
     }
+    free(ffn_dump);
     free(moe_buf);
 
     float *fin = xmalloc((size_t)ne * sizeof(float));

@@ -71,7 +71,7 @@ typedef struct {
 
 int ds4_test_qwen35_gdn_forward(const ds4_test_qwen35_gdn_weights *w,
                                 const float *x, uint32_t n_tokens,
-                                float *state, float *out);
+                                float *state, float *out, FILE *dump);
 
 static void require_ok(int ok, const char *what) {
     if (!ok) {
@@ -263,7 +263,7 @@ static void reference_forward(const ds4_test_qwen35_gdn_weights *w,
 
 static void run_hook(const ds4_test_qwen35_gdn_weights *w, const float *x,
                      uint32_t n_tokens, float *state, float *out) {
-    require_ok(ds4_test_qwen35_gdn_forward(w, x, n_tokens, state, out) == 0,
+    require_ok(ds4_test_qwen35_gdn_forward(w, x, n_tokens, state, out, NULL) == 0,
                "qwen35 gdn forward");
 }
 
@@ -579,9 +579,9 @@ int main(void) {
     }
 
     /* The hook must reject a null weight pointer and a zero-token call. */
-    require_ok(ds4_test_qwen35_gdn_forward(NULL, x, 1, st_hook, actual) != 0,
+    require_ok(ds4_test_qwen35_gdn_forward(NULL, x, 1, st_hook, actual, NULL) != 0,
                "gdn forward rejects a null weight struct");
-    require_ok(ds4_test_qwen35_gdn_forward(&w, x, 0, st_hook, actual) != 0,
+    require_ok(ds4_test_qwen35_gdn_forward(&w, x, 0, st_hook, actual, NULL) != 0,
                "gdn forward rejects zero tokens");
 
     munmap(model, MODEL_BYTES);
