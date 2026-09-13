@@ -389,6 +389,18 @@ $(QWEN35_ATTN_METAL_TEST): tests/test_qwen35_attn_metal.o ds4_metal.o
 .PHONY: test-qwen35-attn-metal
 test-qwen35-attn-metal: $(QWEN35_ATTN_METAL_TEST)
 	./$(QWEN35_ATTN_METAL_TEST)
+
+QWEN35_MOE_ROUTE_METAL_TEST := tests/test_qwen35_moe_route_metal
+
+tests/test_qwen35_moe_route_metal.o: tests/test_qwen35_moe_route_metal.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_qwen35_moe_route_metal.c
+
+$(QWEN35_MOE_ROUTE_METAL_TEST): tests/test_qwen35_moe_route_metal.o ds4_metal.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: test-qwen35-moe-route-metal
+test-qwen35-moe-route-metal: $(QWEN35_MOE_ROUTE_METAL_TEST)
+	./$(QWEN35_MOE_ROUTE_METAL_TEST)
 endif
 
 tests/test_glm53_kda_rocm.o: tests/test_glm53_kda.c ds4_gpu.h
@@ -618,7 +630,7 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_qwen35_gdn_metal tests/test_qwen35_attn_metal tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_qwen35_gdn_metal tests/test_qwen35_attn_metal tests/test_qwen35_moe_route_metal tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 
 tests/test_qwen35_tokenizer.o: tests/test_qwen35_tokenizer.c ds4.h
 	$(CC) $(CFLAGS) -I. -DDS4_NO_GPU -c -o $@ $<

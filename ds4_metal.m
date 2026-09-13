@@ -34131,7 +34131,10 @@ int ds4_gpu_qwen35_moe_route_tensor(
         [enc setBuffer:logitsbuf offset:ds4_gpu_tensor_offset(logits) atIndex:1];
         [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:2];
         [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:3];
-        [enc setThreadgroupMemoryLength:router_threads * sizeof(float) atIndex:0];
+        /* Three threadgroup arrays: exp values, reduction values, reduction
+         * indices.  Must match kernel_qwen35_moe_route's scratch layout. */
+        [enc setThreadgroupMemoryLength:router_threads * 3u * sizeof(float)
+                                 atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(router_threads, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);

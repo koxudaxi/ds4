@@ -366,6 +366,27 @@ static void test_moe_routing(void) {
     n = ds4_test_qwen35_moe_route(logits, 4, 9, idx, w);
     check_u32(n, 4u, "top_k is clamped to the expert count");
 
+    /* Top-k equal to the expert count: every expert is selected exactly once,
+     * ordered by descending probability. */
+    for (int i = 0; i < 8; i++) logits[i] = 0.0f;
+    logits[6] = 3.0f;
+    logits[1] = 1.0f;
+    n = ds4_test_qwen35_moe_route(logits, 8, 8, idx, w);
+    check_u32(n, 8u, "top_k == n selects every expert");
+    check(idx[0] == 6 && idx[1] == 1,
+          "k == n orders by descending probability");
+    {
+        bool seen[8] = { false };
+        float s = 0.0f;
+        for (int i = 0; i < 8; i++) {
+            check(idx[i] >= 0 && idx[i] < 8, "k == n index in range");
+            check(!seen[idx[i]], "k == n selects each expert once");
+            seen[idx[i]] = true;
+            s += w[i];
+        }
+        check(fabsf(s - 1.0f) < 1e-6f, "k == n weights renormalise to 1");
+    }
+
     /* The shared-expert gate is a sigmoid. */
     check(fabsf(ds4_test_qwen35_shared_expert_gate(0.0f) - 0.5f) < 1e-6f,
           "shared expert gate at 0 is 0.5");

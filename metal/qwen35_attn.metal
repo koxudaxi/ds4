@@ -117,9 +117,17 @@ kernel void kernel_qwen35_rope_neox_front_f32(
 // Qwen3.5-MoE router.  Matches ds4.c's qwen35_moe_route exactly: a max-
 // subtracted softmax over ALL experts, top-k selection by probability (ties
 // keep the lower expert index), then renormalisation of the selected k
-// weights.  One threadgroup per token; the whole selection runs on lane 0
-// after the softmax numerator is staged in shared memory.  This is a distinct
-// convention from the DeepSeek (sigmoid) and GLM (softplus) routers.
+// weights.  This is a distinct convention from the DeepSeek (sigmoid) and GLM
+// (softplus) routers.
+//
+// One threadgroup per token.  The softmax numerator and every selection round
+// are computed in parallel across the threadgroup with a max/argmax tree
+// reduction, replacing the old lane-0 O(n*k^2) selection sort that stalled the
+// whole GPU at one threadgroup and dominated decode.  The reduction orders by
+// (value descending, index ascending), so a tie keeps the lower expert index
+// exactly as the CPU selection sort does.  Only the final k weight writes and
+// their denominator sum stay on lane 0, in the same order as before, so the
+// arithmetic is bit-identical to the committed kernel.
 struct qwen35_route_args {
     int32_t n_expert;
     int32_t n_expert_used;
@@ -127,52 +135,90 @@ struct qwen35_route_args {
     int32_t pad0;
 };
 
+// Value/index pair reduction in favour of the larger value; on an exact tie the
+// lower index wins.  `width` must be the launched threadgroup size (a power of
+// two), so every thread, including inactive ones, reaches the barriers.
+static inline int qwen35_route_reduce(
+        threadgroup float * red_val,
+        threadgroup int   * red_idx,
+        uint tid, uint width) {
+    for (uint step = width >> 1; step > 0u; step >>= 1) {
+        if (tid < step) {
+            const float v0 = red_val[tid];
+            const float v1 = red_val[tid + step];
+            const int   i0 = red_idx[tid];
+            const int   i1 = red_idx[tid + step];
+            if (v1 > v0 || (v1 == v0 && i1 < i0)) {
+                red_val[tid] = v1;
+                red_idx[tid] = i1;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return red_idx[0];
+}
+
 kernel void kernel_qwen35_moe_route(
         constant qwen35_route_args & args,
         device const float * logits,
         device int32_t     * selected,
         device float       * weights,
-        threadgroup float  * shmem [[threadgroup(0)]],
+        threadgroup float  * scratch [[threadgroup(0)]],
         uint3   tgpig [[threadgroup_position_in_grid]],
         ushort3 tpitg [[thread_position_in_threadgroup]]) {
     const uint row = tgpig.x;
     const uint tid = tpitg.x;
     const int  n   = args.n_expert;
     const int  k   = args.n_expert_used;
+    const uint width = n > 256 ? 512u : 256u;
+
+    // scratch layout: [width] exp values, [width] reduction values,
+    //                 [width] reduction indices (reinterpreted as int32).
+    threadgroup float *vals    = scratch;
+    threadgroup float *red_val = scratch + width;
+    threadgroup int   *red_idx = (threadgroup int *)(scratch + 2u * width);
 
     device const float *row_logits   = logits   + (uint64_t)row * n;
     device int32_t     *row_selected = selected + (uint64_t)row * k;
     device float       *row_weights  = weights  + (uint64_t)row * k;
 
-    if ((int)tid < n) {
-        float m = row_logits[0];
-        for (int i = 1; i < n; i++) {
-            m = max(m, row_logits[i]);
-        }
-        shmem[tid] = exp(row_logits[tid] - m);
-    }
+    // Global max over the expert row (exact: max is order-independent).
+    const bool active = tid < (uint) n;
+    red_val[tid] = active ? row_logits[tid] : -INFINITY;
+    red_idx[tid] = (int) tid;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    (void) qwen35_route_reduce(red_val, red_idx, tid, width);
+    const float m = red_val[0];
+
+    // Max-subtracted softmax numerator, matching the CPU's float32 exp().
+    vals[tid] = active ? exp(row_logits[tid] - m) : -INFINITY;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (tid == 0 && k <= 32) {
-        int sel[32];
-        for (int t = 0; t < k; t++) {
-            int best = -1;
-            for (int i = 0; i < n; i++) {
-                bool taken = false;
-                for (int j = 0; j < t; j++) {
-                    if (sel[j] == i) { taken = true; break; }
-                }
-                if (taken) continue;
-                if (best < 0 || shmem[i] > shmem[best]) best = i;
-            }
+    // Top-k by repeated parallel argmax.  A winner is struck from `vals` so it
+    // cannot repeat; the struck -INFINITY is below every real exp (the max
+    // expert is exactly 1.0), and ties resolve to the lower index.
+    int   sel[32];
+    float selval[32];
+    for (int t = 0; t < k; t++) {
+        red_val[tid] = vals[tid];
+        red_idx[tid] = (int) tid;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const int best = qwen35_route_reduce(red_val, red_idx, tid, width);
+        if (tid == 0) {
             sel[t] = best;
+            selval[t] = red_val[0];
+            vals[best] = -INFINITY;
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
         float wsum = 0.0f;
-        for (int t = 0; t < k; t++) wsum += shmem[sel[t]];
+        for (int t = 0; t < k; t++) wsum += selval[t];
         if (!(wsum > 0.0f)) wsum = 1.0f;
         for (int t = 0; t < k; t++) {
             row_selected[t] = sel[t];
-            row_weights[t] = shmem[sel[t]] / wsum * args.expert_weight_scale;
+            row_weights[t] = selval[t] / wsum * args.expert_weight_scale;
         }
     }
 }
