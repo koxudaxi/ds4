@@ -53738,6 +53738,11 @@ static bool qwen35_graph_reset(ds4_qwen35_gpu_graph *g) {
     return true;
 }
 
+/* The CPU golden rejects a forward that produced any non-finite logit
+ * (`qwen35_session_forward`).  The GPU graph must apply the same gate so a NaN
+ * cannot silently reach argmax; the definition is below, with the CPU path. */
+static int qwen35_is_finite(const float *p);
+
 /* Encode one decode token at absolute position `pos`; the persistent K/V and
  * GDN state advance.  `logits_out` receives DS4_N_VOCAB f32 values. */
 static bool qwen35_graph_forward_token(ds4_qwen35_gpu_graph *g,
@@ -54107,6 +54112,9 @@ static bool qwen35_graph_forward_token(ds4_qwen35_gpu_graph *g,
                             (uint64_t)DS4_N_VOCAB * sizeof(float)) == 0) {
         return false;
     }
+    for (uint32_t v = 0; v < (uint32_t)DS4_N_VOCAB; v++) {
+        if (!qwen35_is_finite(&logits_out[v])) return false;
+    }
     return true;
 }
 
@@ -54143,12 +54151,20 @@ static int generate_qwen35_metal_argmax(
 
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
     bool ok = true;
+    const double t_prefill0 = now_sec();
     for (int i = 0; ok && i < prompt->len; i++) {
         ok = qwen35_graph_forward_token(&g, model, weights,
                                         (uint32_t)prompt->v[i], (uint32_t)i,
                                         logits);
         if (ok && progress) progress(progress_ud, "prefill_chunk",
                                      i + 1, prompt->len);
+    }
+    const double prefill_s = now_sec() - t_prefill0;
+    if (ok) {
+        ds4_log(stderr, DS4_LOG_TIMING,
+                "ds4: qwen35 Metal prefill: %.2f t/s (%d prompt tokens)\n",
+                prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
+                prompt->len);
     }
     const char *dump = getenv("DS4_METAL_DUMP_PREFILL_LOGITS");
     if (ok && dump && dump[0]) {
@@ -54159,14 +54175,13 @@ static int generate_qwen35_metal_argmax(
         }
     }
 
-    int n_generated = 0;
+    int n_decode = 0;
     uint32_t pos = (uint32_t)prompt->len;
     const double t_decode0 = now_sec();
     for (int i = 0; ok && i < n_predict && pos < (uint32_t)ctx_size; i++) {
         const int token = sample_argmax(logits, DS4_N_VOCAB);
         if (vocab_token_is_generation_stop(vocab, token)) break;
         if (emit) emit(emit_ud, token);
-        n_generated++;
         if (i == n_predict - 1 || pos + 1u >= (uint32_t)ctx_size) break;
         ok = qwen35_graph_forward_token(&g, model, weights, (uint32_t)token,
                                         pos, logits);
@@ -54174,14 +54189,15 @@ static int generate_qwen35_metal_argmax(
             fprintf(stderr, "ds4: qwen35 Metal decode failed at position %u\n", pos);
             break;
         }
+        n_decode++;
         pos++;
     }
     const double decode_s = now_sec() - t_decode0;
     if (done) done(emit_ud);
     if (ok) {
         ds4_log(stderr, DS4_LOG_TIMING,
-                "ds4: qwen35 Metal generation: %.2f t/s\n",
-                decode_s > 0.0 ? (double)n_generated / decode_s : 0.0);
+                "ds4: qwen35 Metal decode: %.2f t/s (%d decode steps)\n",
+                decode_s > 0.0 ? (double)n_decode / decode_s : 0.0, n_decode);
     }
 
     free(logits);
