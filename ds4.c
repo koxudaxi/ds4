@@ -73869,11 +73869,13 @@ static int qwen35_attn_core(
     if ((kv_k == NULL) != (kv_v == NULL)) return 1;
     if (kv_k && (uint64_t)kv_len + n_tokens > kv_cap) return 1;
 
+    const uint32_t hist = kv_k ? kv_len : 0u;
+
     float *q      = xmalloc((size_t)n_tokens * q_gate_dim * sizeof(float));
     float *k      = xmalloc((size_t)n_tokens * kv_dim * sizeof(float));
     float *v      = xmalloc((size_t)n_tokens * kv_dim * sizeof(float));
     float *ctx    = xmalloc((size_t)n_tokens * q_dim * sizeof(float));
-    float *scores = xmalloc((size_t)n_tokens * sizeof(float));
+    float *scores = xmalloc(((size_t)hist + n_tokens) * sizeof(float));
 
     for (uint32_t t = 0; t < n_tokens; t++) {
         const float *xt = normed + (uint64_t)t * n_embd;
@@ -73908,7 +73910,6 @@ static int qwen35_attn_core(
      * causal prefill it always was (history length zero). */
     const float *K_all = k;
     const float *V_all = v;
-    const uint32_t hist = kv_k ? kv_len : 0u;
     if (kv_k) {
         for (uint32_t t = 0; t < n_tokens; t++) {
             memcpy(kv_k + (uint64_t)(kv_len + t) * kv_dim,
@@ -75342,10 +75343,10 @@ static int qwen35_session_moe_forward(const ds4_model *m,
                                    qwen35_moe_dequant_provider, &s, x, out);
 }
 
-/* Run one token at absolute position `pos`, advancing the persistent state and
- * writing `DS4_N_VOCAB` logits.  `pos` sets RoPE; the attention history is
- * `st->len`, so a caller that resets the state between tokens gets a token
- * whose logits depend on itself alone. */
+/* Run one token at absolute position `pos` (which must equal `st->len`),
+ * advancing the persistent state and writing `DS4_N_VOCAB` logits.  `pos` sets
+ * RoPE; the attention history is `st->len`, so a caller that resets the state
+ * between tokens gets a token whose logits depend on itself alone. */
 int qwen35_session_forward(const ds4_model *m, const ds4_weights *w,
                            qwen35_session_state *st, uint32_t token,
                            uint32_t pos, float *logits) {
@@ -75355,7 +75356,8 @@ int qwen35_session_forward(const ds4_model *m, const ds4_weights *w,
     const uint32_t ne      = (uint32_t)DS4_N_EMBD;
     const uint32_t n_vocab = (uint32_t)DS4_N_VOCAB;
     const uint32_t n_exec  = directional_steering_layer_count();
-    if (pos >= st->ctx_size) return 1;
+    if (st->len >= st->ctx_size) return 1;
+    if (pos != st->len) return 1;
 
     qwen35_session_output_prepare(m, w, st);
     qwen35_embed_row(m, w->token_embd, token, st->hidden);
@@ -75439,7 +75441,7 @@ int ds4_test_qwen35_session_run(const char *gguf, const uint32_t *tokens,
     int rc = 0;
     for (uint32_t t = 0; t < n_tokens; t++) {
         if (reset_between && t > 0) qwen35_session_state_reset(st);
-        rc = qwen35_session_forward(&m, &w, st, tokens[t], t, logits_out);
+        rc = qwen35_session_forward(&m, &w, st, tokens[t], st->len, logits_out);
         if (rc != 0) break;
     }
 

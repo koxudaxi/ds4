@@ -11,6 +11,11 @@
  * state reset between them must break the equality, which shows the match is
  * produced by the carried state and not by a re-prefill.
  *
+ * Finally it decodes the seven-token `digits_run` case through the persistent
+ * forward and matches the O4 reference for the same sequence.  History lengths
+ * past a single token are exactly where the attention scratch must span the
+ * cached prefix plus the current token.
+ *
  * The two tokens are the first case of the frozen O0 fixture
  * (tests/test-vectors/ornith-1.5-35b/manifest.json, case cjk_chinese).
  *
@@ -94,15 +99,25 @@ int main(void) {
     /* First case of the frozen O0 fixture. */
     const uint32_t tokens[2] = { 99986u, 99449u };
     const uint32_t continuation[1] = { tokens[1] };
+    /* Frozen O0 fixture case digits_run, seven tokens: the persistent decode
+     * reaches history lengths 1..6, where the old n_tokens-sized attention
+     * scratch overran the heap. */
+    const uint32_t long_tokens[7] = { 16u, 17u, 18u, 19u, 20u, 21u, 22u };
 
     float *ref = calloc(ORNITH_N_VOCAB, sizeof(float));
     float *sess = calloc(ORNITH_N_VOCAB, sizeof(float));
     float *plant = calloc(ORNITH_N_VOCAB, sizeof(float));
+    float *ref_long = calloc(ORNITH_N_VOCAB, sizeof(float));
+    float *sess_long = calloc(ORNITH_N_VOCAB, sizeof(float));
     uint32_t ref_greedy = 0;
-    if (!ref || !sess || !plant) return 2;
+    uint32_t long_greedy = 0;
+    if (!ref || !sess || !plant || !ref_long || !sess_long) return 2;
 
     printf("model: %s\n", model);
     printf("tokens: %u %u\n", tokens[0], tokens[1]);
+    printf("long tokens:");
+    for (uint32_t i = 0; i < 7u; i++) printf(" %u", long_tokens[i]);
+    printf("\n");
 
     double t0 = now_secs();
     const int rrc = ds4_test_qwen35_forward_logits_ref(
@@ -127,18 +142,42 @@ int main(void) {
         return 1;
     }
 
+    const int lrrc = ds4_test_qwen35_forward_logits_ref(
+            model, long_tokens, 7u, long_tokens + 6u, 1u, ref_long, &long_greedy);
+    double t4 = now_secs();
+    if (lrrc != 0) {
+        fprintf(stderr, "FAIL: long reference forward rc=%d\n", lrrc);
+        return 1;
+    }
+
+    const int lsrc = ds4_test_qwen35_session_run(model, long_tokens, 7u, false,
+                                                 sess_long);
+    double t5 = now_secs();
+    if (lsrc != 0) {
+        fprintf(stderr, "FAIL: long session forward rc=%d\n", lsrc);
+        return 1;
+    }
+
     const float ref_vs_sess = max_abs_diff(ref, sess, ORNITH_N_VOCAB);
     const float ref_vs_plant = max_abs_diff(ref, plant, ORNITH_N_VOCAB);
+    const float long_vs_ref = max_abs_diff(ref_long, sess_long, ORNITH_N_VOCAB);
     const uint32_t ref_arg = argmax(ref, ORNITH_N_VOCAB);
     const uint32_t sess_arg = argmax(sess, ORNITH_N_VOCAB);
+    const uint32_t long_ref_arg = argmax(ref_long, ORNITH_N_VOCAB);
+    const uint32_t long_sess_arg = argmax(sess_long, ORNITH_N_VOCAB);
 
     printf("reference forward: %.1fs, session: %.1fs, reset plant: %.1fs\n",
            t1 - t0, t2 - t1, t3 - t2);
+    printf("long reference: %.1fs, long session: %.1fs\n", t4 - t3, t5 - t4);
     printf("second-token argmax: reference %u, session %u\n", ref_arg, sess_arg);
+    printf("seventh-token argmax: reference %u, session %u\n",
+           long_ref_arg, long_sess_arg);
     printf("|session - reference|_inf = %.9g (bound %.1e)\n",
            ref_vs_sess, SESSION_EQUAL_BOUND);
     printf("|reset   - reference|_inf = %.9g (min  %.1e)\n",
            ref_vs_plant, SESSION_DIVERGE_MIN);
+    printf("|long    - reference|_inf = %.9g (bound %.1e)\n",
+           long_vs_ref, SESSION_EQUAL_BOUND);
 
     int failed = 0;
     if (ref_vs_sess > SESSION_EQUAL_BOUND) {
@@ -153,13 +192,23 @@ int main(void) {
         printf("FAIL: reset state still matches -- state is not load-bearing\n");
         failed = 1;
     }
+    if (long_vs_ref > SESSION_EQUAL_BOUND) {
+        printf("FAIL: persistent session does not match the O4 forward over 7 tokens\n");
+        failed = 1;
+    }
+    if (long_ref_arg != long_sess_arg) {
+        printf("FAIL: seventh-token argmax differs\n");
+        failed = 1;
+    }
     if (failed) {
-        free(ref); free(sess); free(plant);
+        free(ref); free(sess); free(plant); free(ref_long); free(sess_long);
         return 1;
     }
     printf("PASS: persistent session matches the O4 forward; reset breaks it\n");
     free(ref);
     free(sess);
     free(plant);
+    free(ref_long);
+    free(sess_long);
     return 0;
 }
