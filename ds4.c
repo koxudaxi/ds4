@@ -73765,12 +73765,9 @@ static float qwen35_shared_expert_gate(float dot) {
     return 1.0f / (1.0f + expf(-dot));
 }
 
-#ifdef DS4_TEST_HOOKS
-/* Pure qwen35 hooks: no model, no GPU, no I/O.  They exist because the GLM 5.3
- * review's Critical finding was a check that never ran: the layer-typing rule
- * and the validation walk were each exercised only by one run against one
- * 20 GiB artifact, so a regression in either would have been invisible.  These
- * make the decisions testable on their own. */
+/* The qwen35moe layer helpers below are production code (they run on the
+ * loaded engine weights once O6 wires the session path).  The model-free test
+ * hooks that exercise them are fenced by DS4_TEST_HOOKS separately. */
 typedef struct {
     /* f32 weights, row-major: element (out, in) is weight[out * in_dim + in].
      * This mirrors the GGUF [in_dim, out_dim] layout the engine reads. */
@@ -73791,7 +73788,7 @@ typedef struct {
     uint32_t     n_rot;
     uint32_t     pos0;
     float        rope_freq_base;
-} ds4_test_qwen35_attn_args;
+} qwen35_attn_args;
 
 /* The qwen35moe full-attention CPU layer: pre-attention RMSNorm, double-width
  * attn_q whose per-head query and sigmoid output gate are interleaved, GQA k/v,
@@ -73851,9 +73848,13 @@ static void qwen35_rope_neox_front(
 static int qwen35_attn_core(
         float                           * attn_out,
         const float                     * normed,
-        const ds4_test_qwen35_attn_args * args,
+        const qwen35_attn_args * args,
         uint32_t                          n_tokens,
-        uint32_t                          pos0) {
+        uint32_t                          pos0,
+        float                           * kv_k,
+        float                           * kv_v,
+        uint32_t                          kv_len,
+        uint32_t                          kv_cap) {
     const uint32_t n_embd     = (uint32_t)DS4_N_EMBD;
     const uint32_t n_head     = DS4_N_HEAD;
     const uint32_t n_head_kv  = DS4_N_HEAD_KV;
@@ -73865,6 +73866,8 @@ static int qwen35_attn_core(
 
     if (group == 0 || n_head % n_head_kv != 0) return 1;
     if (args->n_rot > head_dim || args->n_rot % 2u != 0u) return 1;
+    if ((kv_k == NULL) != (kv_v == NULL)) return 1;
+    if (kv_k && (uint64_t)kv_len + n_tokens > kv_cap) return 1;
 
     float *q      = xmalloc((size_t)n_tokens * q_gate_dim * sizeof(float));
     float *k      = xmalloc((size_t)n_tokens * kv_dim * sizeof(float));
@@ -73900,6 +73903,23 @@ static int qwen35_attn_core(
         }
     }
 
+    /* Persistent GQA KV: append this call's rows after the cached prefix and
+     * attend over the whole prefix.  Without a cache the call is the batched
+     * causal prefill it always was (history length zero). */
+    const float *K_all = k;
+    const float *V_all = v;
+    const uint32_t hist = kv_k ? kv_len : 0u;
+    if (kv_k) {
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            memcpy(kv_k + (uint64_t)(kv_len + t) * kv_dim,
+                   k + (uint64_t)t * kv_dim, (size_t)kv_dim * sizeof(float));
+            memcpy(kv_v + (uint64_t)(kv_len + t) * kv_dim,
+                   v + (uint64_t)t * kv_dim, (size_t)kv_dim * sizeof(float));
+        }
+        K_all = kv_k;
+        V_all = kv_v;
+    }
+
     const float scale = 1.0f / sqrtf((float)head_dim);
     for (uint32_t t = 0; t < n_tokens; t++) {
         for (uint32_t h = 0; h < n_head; h++) {
@@ -73908,9 +73928,9 @@ static int qwen35_attn_core(
                 q + (uint64_t)t * q_gate_dim + (uint64_t)h * 2u * head_dim;
             float *ct = ctx + (uint64_t)t * q_dim + (uint64_t)h * head_dim;
             float max_score = -FLT_MAX;
-            for (uint32_t s = 0; s <= t; s++) {
+            for (uint32_t s = 0; s <= hist + t; s++) {
                 const float *kh =
-                    k + (uint64_t)s * kv_dim + (uint64_t)kv_head * head_dim;
+                    K_all + (uint64_t)s * kv_dim + (uint64_t)kv_head * head_dim;
                 double dot = 0.0;
                 for (uint32_t d = 0; d < head_dim; d++) {
                     dot += (double)qh[d] * kh[d];
@@ -73919,15 +73939,15 @@ static int qwen35_attn_core(
                 if (scores[s] > max_score) max_score = scores[s];
             }
             double denom = 0.0;
-            for (uint32_t s = 0; s <= t; s++) {
+            for (uint32_t s = 0; s <= hist + t; s++) {
                 scores[s] = expf(scores[s] - max_score);
                 denom += scores[s];
             }
             for (uint32_t d = 0; d < head_dim; d++) {
                 double acc = 0.0;
-                for (uint32_t s = 0; s <= t; s++) {
+                for (uint32_t s = 0; s <= hist + t; s++) {
                     const float *vh =
-                        v + (uint64_t)s * kv_dim + (uint64_t)kv_head * head_dim;
+                        V_all + (uint64_t)s * kv_dim + (uint64_t)kv_head * head_dim;
                     acc += ((double)scores[s] / denom) * vh[d];
                 }
                 ct[d] = (float)acc;
@@ -73960,7 +73980,13 @@ static int qwen35_attn_core(
     return 0;
 }
 
-int ds4_test_qwen35_attn_forward(const ds4_test_qwen35_attn_args *args) {
+#ifdef DS4_TEST_HOOKS
+/* Pure qwen35 hooks: no model, no GPU, no I/O.  They exist because the GLM 5.3
+ * review's Critical finding was a check that never ran: the layer-typing rule
+ * and the validation walk were each exercised only by one run against one
+ * 20 GiB artifact, so a regression in either would have been invisible.  These
+ * make the decisions testable on their own. */
+int ds4_test_qwen35_attn_forward(const qwen35_attn_args *args) {
     if (!args || !args->attn_q || !args->attn_k || !args->attn_v ||
         !args->attn_output || !args->attn_norm || !args->ffn_norm ||
         !args->attn_q_norm || !args->attn_k_norm ||
@@ -73999,7 +74025,8 @@ int ds4_test_qwen35_attn_forward(const ds4_test_qwen35_attn_args *args) {
                         n_embd, DS4_RMS_EPS);
     }
 
-    const int rc = qwen35_attn_core(attn, normed, args, n_tokens, args->pos0);
+    const int rc = qwen35_attn_core(attn, normed, args, n_tokens, args->pos0,
+                                    NULL, NULL, 0, 0);
     if (rc != 0) {
         free(resid);
         free(attn);
@@ -74078,6 +74105,7 @@ uint32_t ds4_test_qwen35_moe_route(const float *logits, uint32_t n_expert, uint3
 float ds4_test_qwen35_shared_expert_gate(float dot) {
     return qwen35_shared_expert_gate(dot);
 }
+#endif
 
 /* The qwen35moe MoE feed-forward CPU layer.  The hook is model-free: it takes
  * explicit f32 weight pointers, one post-attention hidden row and one output
@@ -74100,7 +74128,7 @@ typedef struct {
     const float *ffn_gate_shexp;     /* [n_ff_exp][n_embd] */
     const float *ffn_up_shexp;       /* [n_ff_exp][n_embd] */
     const float *ffn_down_shexp;     /* [n_embd][n_ff_exp] */
-} ds4_test_qwen35_moe_weights;
+} qwen35_moe_weights;
 
 /* Run the engine's own f32 matvec by wrapping the explicit pointer in a
  * synthetic 2D tensor, exactly as the attn/gdn hooks do. */
@@ -74122,22 +74150,26 @@ static void qwen35_moe_matvec_f32(
     matvec_f32(out, &m, &t, x);
 }
 
-int ds4_test_qwen35_moe_forward(const ds4_test_qwen35_moe_weights *w,
-                                const float *x, float *out) {
-    if (!w || !w->ffn_gate_inp || !w->ffn_gate_exps || !w->ffn_up_exps ||
-        !w->ffn_down_exps || !w->ffn_gate_inp_shexp || !w->ffn_gate_shexp ||
-        !w->ffn_up_shexp || !w->ffn_down_shexp || !x || !out) {
+/* Which expert weight a provider must return: 0=gate, 1=up, 2=down.  A
+ * provider may point into a full f32 expert stack (the model-free hook) or
+ * dequantise one expert into scratch (the session forward), so the MoE math
+ * keeps exactly one home. */
+typedef const float *(*qwen35_expert_provider)(void *ud, uint32_t expert,
+                                               int which);
+
+static int qwen35_moe_forward_impl(
+        const float *ffn_gate_inp,
+        const float *ffn_gate_inp_shexp,
+        const float *ffn_gate_shexp,
+        const float *ffn_up_shexp,
+        const float *ffn_down_shexp,
+        qwen35_expert_provider provider,
+        void *provider_ud,
+        const float *x,
+        float *out) {
+    if (!ffn_gate_inp || !ffn_gate_inp_shexp || !ffn_gate_shexp ||
+        !ffn_up_shexp || !ffn_down_shexp || !provider || !x || !out) {
         return 1;
-    }
-
-    g_ds4_shape = DS4_SHAPE_ORNITH15;
-
-    /* Pin the compiled preset to the Ornith MoE geometry so the test's
-     * hardcoded constants can only match by construction. */
-    if (DS4_N_EMBD != 2048u || DS4_N_FF_EXP != 512u ||
-        DS4_N_EXPERT != 256u || DS4_N_EXPERT_USED != 8u ||
-        DS4_N_EXPERT_SHARED != 1u) {
-        return 2;
     }
 
     const uint64_t n_embd = DS4_N_EMBD;
@@ -74153,7 +74185,7 @@ int ds4_test_qwen35_moe_forward(const ds4_test_qwen35_moe_weights *w,
     float *h = xmalloc((size_t)n_ff_exp * sizeof(float));
     float *y = xmalloc((size_t)n_embd * sizeof(float));
 
-    qwen35_moe_matvec_f32(logits, w->ffn_gate_inp, n_embd, n_expert, x);
+    qwen35_moe_matvec_f32(logits, ffn_gate_inp, n_embd, n_expert, x);
     const uint32_t used =
         qwen35_moe_route(logits, n_expert, n_used, indices, weights);
 
@@ -74161,12 +74193,14 @@ int ds4_test_qwen35_moe_forward(const ds4_test_qwen35_moe_weights *w,
 
     for (uint32_t k = 0; k < used; k++) {
         const uint32_t e = indices[k];
-        const float *gate_e =
-            w->ffn_gate_exps + (uint64_t)e * n_ff_exp * n_embd;
-        const float *up_e =
-            w->ffn_up_exps + (uint64_t)e * n_ff_exp * n_embd;
-        const float *down_e =
-            w->ffn_down_exps + (uint64_t)e * n_embd * n_ff_exp;
+        const float *gate_e = provider(provider_ud, e, 0);
+        const float *up_e = provider(provider_ud, e, 1);
+        const float *down_e = provider(provider_ud, e, 2);
+        if (!gate_e || !up_e || !down_e) {
+            free(y); free(h); free(up); free(gate);
+            free(weights); free(indices); free(logits);
+            return 1;
+        }
 
         qwen35_moe_matvec_f32(gate, gate_e, n_embd, n_ff_exp, x);
         qwen35_moe_matvec_f32(up, up_e, n_embd, n_ff_exp, x);
@@ -74187,15 +74221,15 @@ int ds4_test_qwen35_moe_forward(const ds4_test_qwen35_moe_weights *w,
 
     /* Shared expert: h_s = silu(gate_s . x) * (up_s . x); y_s = down_s . h_s;
      * out += sigmoid(ffn_gate_inp_shexp . x) * y_s. */
-    qwen35_moe_matvec_f32(gate, w->ffn_gate_shexp, n_embd, n_ff_exp, x);
-    qwen35_moe_matvec_f32(up, w->ffn_up_shexp, n_embd, n_ff_exp, x);
+    qwen35_moe_matvec_f32(gate, ffn_gate_shexp, n_embd, n_ff_exp, x);
+    qwen35_moe_matvec_f32(up, ffn_up_shexp, n_embd, n_ff_exp, x);
     for (uint64_t j = 0; j < n_ff_exp; j++)
         h[j] = silu(gate[j]) * up[j];
-    qwen35_moe_matvec_f32(y, w->ffn_down_shexp, n_ff_exp, n_embd, h);
+    qwen35_moe_matvec_f32(y, ffn_down_shexp, n_ff_exp, n_embd, h);
     {
         double sgate = 0.0;
         for (uint64_t d = 0; d < n_embd; d++)
-            sgate += (double)w->ffn_gate_inp_shexp[d] * x[d];
+            sgate += (double)ffn_gate_inp_shexp[d] * x[d];
         const float g = qwen35_shared_expert_gate((float)sgate);
         for (uint64_t d = 0; d < n_embd; d++)
             out[d] += g * y[d];
@@ -74211,6 +74245,52 @@ int ds4_test_qwen35_moe_forward(const ds4_test_qwen35_moe_weights *w,
     return 0;
 }
 
+#ifdef DS4_TEST_HOOKS
+typedef struct {
+    const float *gate;
+    const float *up;
+    const float *down;
+} qwen35_moe_test_src;
+
+static const float *qwen35_moe_test_provider(void *ud, uint32_t expert,
+                                             int which) {
+    const qwen35_moe_test_src *s = (const qwen35_moe_test_src *)ud;
+    const uint64_t off = (uint64_t)expert * DS4_N_FF_EXP * DS4_N_EMBD;
+    switch (which) {
+    case 0: return s->gate + off;
+    case 1: return s->up + off;
+    default: return s->down + off;
+    }
+}
+
+int ds4_test_qwen35_moe_forward(const qwen35_moe_weights *w,
+                                const float *x, float *out) {
+    if (!w || !w->ffn_gate_inp || !w->ffn_gate_exps || !w->ffn_up_exps ||
+        !w->ffn_down_exps || !w->ffn_gate_inp_shexp || !w->ffn_gate_shexp ||
+        !w->ffn_up_shexp || !w->ffn_down_shexp || !x || !out) {
+        return 1;
+    }
+
+    g_ds4_shape = DS4_SHAPE_ORNITH15;
+
+    /* Pin the compiled preset to the Ornith MoE geometry so the test's
+     * hardcoded constants can only match by construction. */
+    if (DS4_N_EMBD != 2048u || DS4_N_FF_EXP != 512u ||
+        DS4_N_EXPERT != 256u || DS4_N_EXPERT_USED != 8u ||
+        DS4_N_EXPERT_SHARED != 1u) {
+        return 2;
+    }
+
+    qwen35_moe_test_src s = { w->ffn_gate_exps, w->ffn_up_exps,
+                              w->ffn_down_exps };
+    return qwen35_moe_forward_impl(w->ffn_gate_inp, w->ffn_gate_inp_shexp,
+                                   w->ffn_gate_shexp, w->ffn_up_shexp,
+                                   w->ffn_down_shexp,
+                                   qwen35_moe_test_provider, &s, x, out);
+}
+#endif
+
+#ifdef DS4_TEST_HOOKS
 /* Render a chat turn into `out` for comparison against the GGUF's own Jinja
  * template.  Pure text: no vocabulary, no model. */
 void ds4_test_qwen35_render_chat(const char *system, const char *prompt, bool thinking,
@@ -74237,6 +74317,7 @@ void ds4_test_qwen35_render_turn(const char *role, const char *content,
     snprintf(out, cap, "%s", b.ptr);
     free(b.ptr);
 }
+#endif
 
 /* The qwen35moe gated-delta-net (linear attention) CPU layer.  The hook is
  * model-free: it takes explicit f32 weight pointers, an input row (or a short
@@ -74260,7 +74341,7 @@ typedef struct {
     const float *gdn_norm;    /* [d_v] */
     const float *gdn_out;     /* [n_embd][d_inner] */
     const float *gdn_z;       /* [d_inner][n_embd] */
-} ds4_test_qwen35_gdn_weights;
+} qwen35_gdn_weights;
 
 static void qwen35_gdn_matvec_f32(
         float          * out,
@@ -74290,7 +74371,7 @@ static void qwen35_gdn_dump_node(FILE *fp, const char *name,
     fprintf(fp, "\n");
 }
 
-int ds4_test_qwen35_gdn_forward(const ds4_test_qwen35_gdn_weights *w,
+static int qwen35_gdn_forward(const qwen35_gdn_weights *w,
                                 const float *x, uint32_t n_tokens,
                                 float *state, float *out, FILE *dump) {
     if (!w || !w->gdn_qkv || !w->gdn_conv1d || !w->gdn_alpha ||
@@ -74487,6 +74568,14 @@ int ds4_test_qwen35_gdn_forward(const ds4_test_qwen35_gdn_weights *w,
     return 0;
 }
 
+#ifdef DS4_TEST_HOOKS
+int ds4_test_qwen35_gdn_forward(const qwen35_gdn_weights *w,
+                                const float *x, uint32_t n_tokens,
+                                float *state, float *out, FILE *dump) {
+    return qwen35_gdn_forward(w, x, n_tokens, state, out, dump);
+}
+#endif
+
 /* =========================================================================
  * O4: qwen35moe CPU forward over the real GGUF.
  * =========================================================================
@@ -74608,6 +74697,7 @@ static void qwen35_embed_row(const ds4_model *m, const ds4_tensor *emb,
     qwen35_dequant_row(emb, base + (uint64_t)token * qwen35_row_bytes(emb), dst);
 }
 
+#ifdef DS4_TEST_HOOKS
 /* Falsifier switch for the step-0 match (spec: "Shown to fail").  When
  * DS4_QWEN35_PERTURB_LAYER names a layer index, that layer's residual output is
  * perturbed so the end-to-end greedy match must break; unset in every real run.
@@ -74625,6 +74715,7 @@ static float qwen35_perturb_factor(void) {
     if (!s || !s[0]) return 2.0f;
     return strtof(s, NULL);
 }
+#endif
 
 /* Fast-math-safe finite test.  This TU is built with -ffast-math, which implies
  * -ffinite-math-only: the compiler then folds isfinite(), (x != x) and even a
@@ -74638,6 +74729,7 @@ static int qwen35_is_finite(const float *p) {
     return (bits & 0x7f800000u) != 0x7f800000u;
 }
 
+#ifdef DS4_TEST_HOOKS
 /* Test-only forcing function for the finite gate: DS4_QWEN35_NAN_LOGIT=<index>
  * writes a quiet NaN there so the gate is seen to fire.  Unset in every real
  * run.  Returns -1 when unset or malformed. */
@@ -74719,7 +74811,7 @@ static int qwen35_forward_prefill(
         }
 
         if (!ds4_qwen35moe_layer_is_linear(il)) {
-            ds4_test_qwen35_attn_args a;
+            qwen35_attn_args a;
             memset(&a, 0, sizeof(a));
             a.attn_q       = qwen35_dequant_tensor(m, l->attn_q);
             a.attn_k       = qwen35_dequant_tensor(m, l->attn_k);
@@ -74729,13 +74821,14 @@ static int qwen35_forward_prefill(
             a.attn_k_norm  = qwen35_dequant_tensor(m, l->attn_k_norm);
             a.n_rot        = DS4_N_ROT;
             a.rope_freq_base = DS4_ROPE_FREQ_BASE;
-            const int rc = qwen35_attn_core(worked, normed, &a, len, 0);
+            const int rc = qwen35_attn_core(worked, normed, &a, len, 0,
+                                            NULL, NULL, 0, 0);
             free((void *)a.attn_q);       free((void *)a.attn_k);
             free((void *)a.attn_v);       free((void *)a.attn_output);
             free((void *)a.attn_q_norm);  free((void *)a.attn_k_norm);
             if (rc != 0) { free(ffn_dump); free(moe_buf); return rc; }
         } else {
-            ds4_test_qwen35_gdn_weights g;
+            qwen35_gdn_weights g;
             g.gdn_qkv     = qwen35_dequant_tensor(m, l->gdn_qkv);
             g.gdn_conv1d  = qwen35_dequant_tensor(m, l->gdn_conv1d);
             g.gdn_alpha   = qwen35_dequant_tensor(m, l->gdn_alpha);
@@ -74773,7 +74866,7 @@ static int qwen35_forward_prefill(
             qwen35_dump_states(dump, nm, post, ne, len);
         }
 
-        ds4_test_qwen35_moe_weights mw;
+        qwen35_moe_weights mw;
         mw.ffn_gate_inp       = qwen35_dequant_tensor(m, l->ffn_gate_inp);
         mw.ffn_gate_exps      = qwen35_dequant_tensor(m, l->ffn_gate_exps);
         mw.ffn_up_exps        = qwen35_dequant_tensor(m, l->ffn_up_exps);
@@ -74976,6 +75069,381 @@ int ds4_test_qwen35_dump_layers(const char *gguf, const uint32_t *tokens,
     free(worked);
     free(normed);
     free(hidden);
+    model_close(&m);
+    return rc;
+}
+#endif
+
+/* =========================================================================
+ * O6: persistent qwen35moe CPU session forward.
+ * =========================================================================
+ *
+ * One token per call on the engine's already-loaded model/weights, with the
+ * per-session state carried across calls:
+ *   - GQA K/V for the full-attention blocks, one row per consumed position;
+ *   - the gated-delta-net recurrent + conv state for the linear blocks;
+ *   - a per-session cache of the dequantised non-expert weights, so a token
+ *     pays for the matmuls and only the routed experts it selected.
+ *
+ * The routed expert tensors are ~130 GiB in f32, so they are never cached
+ * whole: the forward dequantises just the experts the router chose, into a
+ * bounded scratch.  That keeps per-token dequantisation proportional to the
+ * per-token matmuls instead of 32x them. */
+
+typedef struct {
+    bool ready;
+    const float *attn_norm;   /* [n_embd] */
+    const float *ffn_norm;    /* [n_embd] */
+    qwen35_attn_args attn;    /* full-attention weights; NULL on a linear block */
+    qwen35_gdn_weights gdn;   /* GDN weights; NULL on a full-attention block */
+    /* MoE non-expert weights (routed experts are dequantised per token). */
+    const float *ffn_gate_inp;       /* [n_expert][n_embd] */
+    const float *ffn_gate_inp_shexp; /* [n_embd] */
+    const float *ffn_gate_shexp;     /* [n_ff_exp][n_embd] */
+    const float *ffn_up_shexp;       /* [n_ff_exp][n_embd] */
+    const float *ffn_down_shexp;     /* [n_embd][n_ff_exp] */
+} qwen35_layer_cache;
+
+typedef struct {
+    uint32_t ctx_size;     /* allocated positions of K/V per full block */
+    uint32_t len;          /* positions consumed so far */
+    uint32_t n_full;       /* full-attention block slots */
+    uint32_t n_linear;     /* linear block slots */
+    uint32_t kv_dim;       /* n_head_kv * head_dim */
+    uint64_t gdn_floats;   /* floats per linear block */
+
+    float *kv_k;           /* [n_full][ctx_size][kv_dim] */
+    float *kv_v;           /* [n_full][ctx_size][kv_dim] */
+    float *gdn;            /* [n_linear][gdn_floats] */
+
+    qwen35_layer_cache *layer;   /* [n_layer] */
+
+    /* Session-long dequantised weights, filled on first forward. */
+    bool output_ready;
+    float *output_norm;    /* [n_embd] */
+    float *output;         /* [n_vocab][n_embd] */
+
+    /* Per-token scratch. */
+    float *hidden;         /* [n_embd] */
+    float *normed;         /* [n_embd] */
+    float *worked;         /* [n_embd] */
+    float *post;           /* [n_embd] */
+    float *moe_out;        /* [n_embd] */
+    float *final_norm;     /* [n_embd] */
+    float *expert_gate;    /* [n_ff_exp][n_embd] */
+    float *expert_up;      /* [n_ff_exp][n_embd] */
+    float *expert_down;    /* [n_embd][n_ff_exp] */
+} qwen35_session_state;
+
+static uint32_t qwen35_session_full_blocks(void) {
+    uint32_t n = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!ds4_qwen35moe_layer_is_linear(il)) n++;
+    }
+    return n;
+}
+
+qwen35_session_state *qwen35_session_state_create(uint32_t ctx_size) {
+    g_ds4_shape = DS4_SHAPE_ORNITH15;
+
+    const uint32_t n_embd  = (uint32_t)DS4_N_EMBD;
+    const uint32_t n_v     = DS4_N_GDN_VALUE_HEAD;
+    const uint32_t d_v     = DS4_N_GDN_VALUE_DIM;
+    const uint32_t d_k     = DS4_N_GDN_HEAD_DIM;
+    const uint32_t conv_dim = 2u * DS4_N_GDN_KEY_HEAD * d_k + n_v * d_v;
+
+    qwen35_session_state *st = xcalloc(1, sizeof(*st));
+    st->ctx_size = ctx_size ? ctx_size : (uint32_t)DS4_ROPE_ORIG_CTX;
+    st->n_full   = qwen35_session_full_blocks();
+    st->n_linear = (uint32_t)DS4_N_LAYER - st->n_full;
+    st->kv_dim   = (uint32_t)DS4_N_HEAD_KV * (uint32_t)DS4_N_HEAD_DIM;
+    st->gdn_floats = (uint64_t)n_v * d_v * d_k +
+                     (uint64_t)(DS4_N_GDN_CONV - 1u) * conv_dim;
+
+    st->kv_k = xcalloc((size_t)st->n_full * st->ctx_size * st->kv_dim,
+                       sizeof(float));
+    st->kv_v = xcalloc((size_t)st->n_full * st->ctx_size * st->kv_dim,
+                       sizeof(float));
+    st->gdn  = xcalloc((size_t)st->n_linear * st->gdn_floats, sizeof(float));
+    st->layer = xcalloc((size_t)DS4_N_LAYER, sizeof(qwen35_layer_cache));
+
+    st->hidden     = xmalloc((size_t)n_embd * sizeof(float));
+    st->normed     = xmalloc((size_t)n_embd * sizeof(float));
+    st->worked     = xmalloc((size_t)n_embd * sizeof(float));
+    st->post       = xmalloc((size_t)n_embd * sizeof(float));
+    st->moe_out    = xmalloc((size_t)n_embd * sizeof(float));
+    st->final_norm = xmalloc((size_t)n_embd * sizeof(float));
+    st->expert_gate = xmalloc((size_t)DS4_N_FF_EXP * n_embd * sizeof(float));
+    st->expert_up   = xmalloc((size_t)DS4_N_FF_EXP * n_embd * sizeof(float));
+    st->expert_down = xmalloc((size_t)n_embd * DS4_N_FF_EXP * sizeof(float));
+    return st;
+}
+
+void qwen35_session_state_free(qwen35_session_state *st) {
+    if (!st) return;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        qwen35_layer_cache *lc = &st->layer[il];
+        free((void *)lc->attn_norm);
+        free((void *)lc->ffn_norm);
+        free((void *)lc->attn.attn_q);
+        free((void *)lc->attn.attn_k);
+        free((void *)lc->attn.attn_v);
+        free((void *)lc->attn.attn_output);
+        free((void *)lc->attn.attn_q_norm);
+        free((void *)lc->attn.attn_k_norm);
+        free((void *)lc->gdn.gdn_qkv);
+        free((void *)lc->gdn.gdn_conv1d);
+        free((void *)lc->gdn.gdn_alpha);
+        free((void *)lc->gdn.gdn_beta);
+        free((void *)lc->gdn.gdn_a_log);
+        free((void *)lc->gdn.gdn_dt_bias);
+        free((void *)lc->gdn.gdn_norm);
+        free((void *)lc->gdn.gdn_out);
+        free((void *)lc->gdn.gdn_z);
+        free((void *)lc->ffn_gate_inp);
+        free((void *)lc->ffn_gate_inp_shexp);
+        free((void *)lc->ffn_gate_shexp);
+        free((void *)lc->ffn_up_shexp);
+        free((void *)lc->ffn_down_shexp);
+    }
+    free(st->layer);
+    free(st->output_norm);
+    free(st->output);
+    free(st->kv_k);
+    free(st->kv_v);
+    free(st->gdn);
+    free(st->hidden);
+    free(st->normed);
+    free(st->worked);
+    free(st->post);
+    free(st->moe_out);
+    free(st->final_norm);
+    free(st->expert_gate);
+    free(st->expert_up);
+    free(st->expert_down);
+    free(st);
+}
+
+/* Drop the consumed history but keep the weights cache.  The forward uses
+ * `len` for the K/V write offset and attention history, so this is also the
+ * persistence plant: clearing between tokens makes a token's logits depend on
+ * itself alone. */
+void qwen35_session_state_reset(qwen35_session_state *st) {
+    if (!st) return;
+    st->len = 0;
+    memset(st->kv_k, 0,
+           (size_t)st->n_full * st->ctx_size * st->kv_dim * sizeof(float));
+    memset(st->kv_v, 0,
+           (size_t)st->n_full * st->ctx_size * st->kv_dim * sizeof(float));
+    memset(st->gdn, 0, (size_t)st->n_linear * st->gdn_floats * sizeof(float));
+}
+
+static void qwen35_layer_cache_fill(const ds4_model *m, const ds4_weights *w,
+                                    uint32_t il, qwen35_layer_cache *lc) {
+    if (lc->ready) return;
+    const ds4_layer_weights *l = &w->layer[il];
+
+    lc->attn_norm = qwen35_dequant_tensor(m, l->attn_norm);
+    lc->ffn_norm  = qwen35_dequant_tensor(m, l->ffn_norm);
+
+    if (!ds4_qwen35moe_layer_is_linear(il)) {
+        qwen35_attn_args a;
+        memset(&a, 0, sizeof(a));
+        a.attn_q         = qwen35_dequant_tensor(m, l->attn_q);
+        a.attn_k         = qwen35_dequant_tensor(m, l->attn_k);
+        a.attn_v         = qwen35_dequant_tensor(m, l->attn_v);
+        a.attn_output    = qwen35_dequant_tensor(m, l->attn_output);
+        a.attn_q_norm    = qwen35_dequant_tensor(m, l->attn_q_norm);
+        a.attn_k_norm    = qwen35_dequant_tensor(m, l->attn_k_norm);
+        a.n_rot          = DS4_N_ROT;
+        a.rope_freq_base = DS4_ROPE_FREQ_BASE;
+        lc->attn = a;
+    } else {
+        qwen35_gdn_weights g;
+        memset(&g, 0, sizeof(g));
+        g.gdn_qkv     = qwen35_dequant_tensor(m, l->gdn_qkv);
+        g.gdn_conv1d  = qwen35_dequant_tensor(m, l->gdn_conv1d);
+        g.gdn_alpha   = qwen35_dequant_tensor(m, l->gdn_alpha);
+        g.gdn_beta    = qwen35_dequant_tensor(m, l->gdn_beta);
+        g.gdn_a_log   = qwen35_dequant_tensor(m, l->gdn_a_log);
+        g.gdn_dt_bias = qwen35_dequant_tensor(m, l->gdn_dt_bias);
+        g.gdn_norm    = qwen35_dequant_tensor(m, l->gdn_norm);
+        g.gdn_out     = qwen35_dequant_tensor(m, l->gdn_out);
+        g.gdn_z       = qwen35_dequant_tensor(m, l->gdn_z);
+        lc->gdn = g;
+    }
+
+    lc->ffn_gate_inp       = qwen35_dequant_tensor(m, l->ffn_gate_inp);
+    lc->ffn_gate_inp_shexp = qwen35_dequant_tensor(m, l->ffn_gate_inp_shexp);
+    lc->ffn_gate_shexp     = qwen35_dequant_tensor(m, l->ffn_gate_shexp);
+    lc->ffn_up_shexp       = qwen35_dequant_tensor(m, l->ffn_up_shexp);
+    lc->ffn_down_shexp     = qwen35_dequant_tensor(m, l->ffn_down_shexp);
+    lc->ready = true;
+}
+
+static void qwen35_session_output_prepare(const ds4_model *m,
+                                          const ds4_weights *w,
+                                          qwen35_session_state *st) {
+    if (st->output_ready) return;
+    st->output_norm = qwen35_dequant_tensor(m, w->output_norm);
+    st->output      = qwen35_dequant_tensor(m, w->output);
+    st->output_ready = true;
+}
+
+/* Dequantise one routed expert of a stacked [n_expert][out][in] tensor into
+ * `dst` ([out][in]).  This is the per-token cost the router gates. */
+static float *qwen35_dequant_expert(const ds4_model *m, const ds4_tensor *t,
+                                    uint32_t expert, float *dst) {
+    uint64_t in_dim = 0, out_dim = 0, row_bytes = 0;
+    const uint8_t *base =
+        tensor_expert_bytes(m, t, expert, &in_dim, &out_dim, &row_bytes);
+    for (uint64_t r = 0; r < out_dim; r++) {
+        qwen35_dequant_row(t, base + r * row_bytes, dst + r * in_dim);
+    }
+    return dst;
+}
+
+typedef struct {
+    const ds4_model *m;
+    const ds4_tensor *gate_t;
+    const ds4_tensor *up_t;
+    const ds4_tensor *down_t;
+    float *gate_buf;
+    float *up_buf;
+    float *down_buf;
+} qwen35_moe_dequant_src;
+
+static const float *qwen35_moe_dequant_provider(void *ud, uint32_t expert,
+                                                int which) {
+    qwen35_moe_dequant_src *s = (qwen35_moe_dequant_src *)ud;
+    switch (which) {
+    case 0: return qwen35_dequant_expert(s->m, s->gate_t, expert, s->gate_buf);
+    case 1: return qwen35_dequant_expert(s->m, s->up_t, expert, s->up_buf);
+    default:return qwen35_dequant_expert(s->m, s->down_t, expert, s->down_buf);
+    }
+}
+
+static int qwen35_session_moe_forward(const ds4_model *m,
+                                      const ds4_layer_weights *l,
+                                      const qwen35_layer_cache *lc,
+                                      qwen35_session_state *st,
+                                      const float *x, float *out) {
+    qwen35_moe_dequant_src s;
+    s.m = m;
+    s.gate_t = l->ffn_gate_exps;
+    s.up_t = l->ffn_up_exps;
+    s.down_t = l->ffn_down_exps;
+    s.gate_buf = st->expert_gate;
+    s.up_buf = st->expert_up;
+    s.down_buf = st->expert_down;
+    return qwen35_moe_forward_impl(lc->ffn_gate_inp, lc->ffn_gate_inp_shexp,
+                                   lc->ffn_gate_shexp, lc->ffn_up_shexp,
+                                   lc->ffn_down_shexp,
+                                   qwen35_moe_dequant_provider, &s, x, out);
+}
+
+/* Run one token at absolute position `pos`, advancing the persistent state and
+ * writing `DS4_N_VOCAB` logits.  `pos` sets RoPE; the attention history is
+ * `st->len`, so a caller that resets the state between tokens gets a token
+ * whose logits depend on itself alone. */
+int qwen35_session_forward(const ds4_model *m, const ds4_weights *w,
+                           qwen35_session_state *st, uint32_t token,
+                           uint32_t pos, float *logits) {
+    g_ds4_shape = DS4_SHAPE_ORNITH15;
+    if (!m || !w || !st || !logits) return 1;
+
+    const uint32_t ne      = (uint32_t)DS4_N_EMBD;
+    const uint32_t n_vocab = (uint32_t)DS4_N_VOCAB;
+    const uint32_t n_exec  = directional_steering_layer_count();
+    if (pos >= st->ctx_size) return 1;
+
+    qwen35_session_output_prepare(m, w, st);
+    qwen35_embed_row(m, w->token_embd, token, st->hidden);
+
+    uint32_t full_idx = 0;
+    uint32_t linear_idx = 0;
+    for (uint32_t il = 0; il < n_exec; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        qwen35_layer_cache *lc = &st->layer[il];
+        qwen35_layer_cache_fill(m, w, il, lc);
+
+        rms_norm_weight(st->normed, st->hidden, lc->attn_norm, ne, DS4_RMS_EPS);
+
+        int rc;
+        if (!ds4_qwen35moe_layer_is_linear(il)) {
+            qwen35_attn_args a = lc->attn;
+            rc = qwen35_attn_core(
+                    st->worked, st->normed, &a, 1, pos,
+                    st->kv_k + (uint64_t)full_idx * st->ctx_size * st->kv_dim,
+                    st->kv_v + (uint64_t)full_idx * st->ctx_size * st->kv_dim,
+                    st->len, st->ctx_size);
+            full_idx++;
+        } else {
+            qwen35_gdn_weights g = lc->gdn;
+            rc = qwen35_gdn_forward(
+                    &g, st->normed, 1,
+                    st->gdn + (uint64_t)linear_idx * st->gdn_floats,
+                    st->worked, NULL);
+            linear_idx++;
+        }
+        if (rc != 0) return rc;
+
+        for (uint32_t d = 0; d < ne; d++)
+            st->worked[d] += st->hidden[d];
+        rms_norm_weight(st->post, st->worked, lc->ffn_norm, ne, DS4_RMS_EPS);
+
+        rc = qwen35_session_moe_forward(m, l, lc, st, st->post, st->moe_out);
+        if (rc != 0) return rc;
+        for (uint32_t d = 0; d < ne; d++)
+            st->hidden[d] = st->worked[d] + st->moe_out[d];
+    }
+
+    st->len += 1u;
+
+    rms_norm_weight(st->final_norm, st->hidden, st->output_norm, ne,
+                    DS4_RMS_EPS);
+    qwen35_attn_matvec_f32(logits, st->output, ne, n_vocab, st->final_norm);
+
+    for (uint32_t v = 0; v < n_vocab; v++) {
+        if (!qwen35_is_finite(&logits[v])) return 1;
+    }
+    return 0;
+}
+
+#ifdef DS4_TEST_HOOKS
+/* Engine-tier test entry: load the model/weights once, hold them across the
+ * whole token sequence, and call the production forward (never re-opening the
+ * GGUF).  `reset_between` plants the persistence failure by clearing the state
+ * after every token but the first. */
+int ds4_test_qwen35_session_run(const char *gguf, const uint32_t *tokens,
+                                uint32_t n_tokens, bool reset_between,
+                                float *logits_out) {
+    if (!gguf || !tokens || n_tokens == 0 || !logits_out) return 1;
+
+    ds4_model m;
+    memset(&m, 0, sizeof(m));
+    m.fd = -1;
+    ds4_weights w;
+    memset(&w, 0, sizeof(w));
+
+    model_open(&m, gguf, false, false);
+    config_validate_model(&m);
+    weights_bind(&w, &m, false, 0, 0, true, false);
+
+    qwen35_session_state *st = qwen35_session_state_create(n_tokens);
+    if (!st) {
+        model_close(&m);
+        return 1;
+    }
+
+    int rc = 0;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        if (reset_between && t > 0) qwen35_session_state_reset(st);
+        rc = qwen35_session_forward(&m, &w, st, tokens[t], t, logits_out);
+        if (rc != 0) break;
+    }
+
+    qwen35_session_state_free(st);
     model_close(&m);
     return rc;
 }

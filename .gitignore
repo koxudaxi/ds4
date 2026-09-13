@@ -33,6 +33,7 @@
 /tests/test_qwen35_attn
 /tests/test_qwen35_gdn
 /tests/test_qwen35_moe
+/tests/test_qwen35_session
 /tests/test_sampling
 /tests/test_glm53_kda
 *.o
