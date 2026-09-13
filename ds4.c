@@ -54338,6 +54338,17 @@ typedef struct {
     uint8_t fingerprint[32];
 } ds4_vision_identity;
 
+/* The qwen35moe per-session forward state (GQA K/V + GDN recurrence).  Only a
+ * pointer is held here; the definition lives next to the production forward. */
+typedef struct qwen35_session_state qwen35_session_state;
+
+qwen35_session_state *qwen35_session_state_create(uint32_t ctx_size);
+void qwen35_session_state_free(qwen35_session_state *st);
+void qwen35_session_state_reset(qwen35_session_state *st);
+int qwen35_session_forward(const ds4_model *m, const ds4_weights *w,
+                           qwen35_session_state *st, uint32_t token,
+                           uint32_t pos, float *logits);
+
 struct ds4_session {
     ds4_engine *engine;
     ds4_dist_session *distributed;
@@ -54365,6 +54376,7 @@ struct ds4_session {
 #endif
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
+    qwen35_session_state *qwen35_state;
     token_vec checkpoint;
     ds4_vision_identity *checkpoint_images;
     size_t checkpoint_image_count;
@@ -63018,15 +63030,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
     if (opt->warm_weights) model_warm_weights(&e->model);
     config_validate_model(&e->model);
-    /* The qwen35moe family has loader, metadata, and shape validation only.
-     * Anything that would execute the model must refuse here rather than fall
-     * through into the DeepSeek or GLM graph, which would emit plausible
-     * garbage instead of an error.  --inspect-only stays available because it
-     * never reaches a forward pass. */
-    if (ds4_model_is_qwen35moe() && !opt->inspect_only) {
+    /* The qwen35moe family runs on the CPU session path.  A graph backend
+     * would fall through into the DeepSeek or GLM graph, which would emit
+     * plausible garbage instead of an error, so refuse there.  --inspect-only
+     * stays available because it never reaches a forward pass. */
+    if (ds4_model_is_qwen35moe() && !opt->inspect_only &&
+        opt->backend != DS4_BACKEND_CPU) {
         fprintf(stderr,
-                "ds4: the qwen35moe forward graph is not implemented; "
-                "only --inspect-only validation is available\n");
+                "ds4: the qwen35moe forward graph is not implemented on %s; "
+                "use --cpu for inference or --inspect-only for validation\n",
+                ds4_backend_name(opt->backend));
         ds4_engine_close(e);
         *out = NULL;
         return 1;
@@ -64048,6 +64061,15 @@ bool ds4_engine_is_glm53(ds4_engine *e) {
     return ds4_model_is_glm53();
 }
 
+/* True when the open engine's model is the qwen35moe family.  The CPU session
+ * path dispatches on this; the CLI forces the session path for it because the
+ * greedy no-session path is DeepSeek-only.  Not in ds4.h by design: the CLI
+ * declares it locally rather than growing the public header for one caller. */
+bool ds4_engine_is_qwen35moe(ds4_engine *e) {
+    (void)e;
+    return ds4_model_is_qwen35moe();
+}
+
 /* Decode gate firing schedule for the TP transport (see ds4_tp_identity).
  * Resident GLM splits attention and FFN on sparse layers. Streaming keeps
  * attention replicated and exchanges only the routed FFN partial. */
@@ -64627,6 +64649,16 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         cpu_decode_scratch_init(&s->cpu_scratch, (uint32_t)ctx_size);
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
+        if (ds4_model_is_qwen35moe()) {
+            /* Size the K/V to the requested context, not the model's 262144
+             * training context: the latter would allocate ~11.8 GiB of K/V for
+             * a typical CLI run. */
+            s->qwen35_state = qwen35_session_state_create((uint32_t)ctx_size);
+            if (!s->qwen35_state) {
+                ds4_session_free(s);
+                return 1;
+            }
+        }
         if (!ds4_session_tp_register(s)) {
             ds4_session_free(s);
             return 1;
@@ -64944,6 +64976,7 @@ void ds4_session_free(ds4_session *s) {
     if (ds4_session_is_cpu(s)) {
         kv_cache_free(&s->cpu_cache);
         cpu_decode_scratch_free(&s->cpu_scratch);
+        qwen35_session_state_free(s->qwen35_state);
     }
 #ifndef DS4_NO_GPU
     else {
@@ -66412,6 +66445,50 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
     }
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
+        if (s->qwen35_state) {
+            /* qwen35moe prefill: one token at a time through the persistent
+             * forward, resuming an existing checkpoint when the prompt extends
+             * it. */
+            int start = 0;
+            if (s->checkpoint_valid &&
+                prompt->len >= s->checkpoint.len &&
+                ds4_tokens_starts_with(prompt, &s->checkpoint))
+            {
+                start = s->checkpoint.len;
+            } else {
+                s->checkpoint.len = 0;
+                s->checkpoint_valid = false;
+                qwen35_session_state_reset(s->qwen35_state);
+            }
+            for (int i = start; i < prompt->len; i++) {
+                if (ds4_session_cancelled(s)) {
+                    snprintf(err, errlen, "interrupted");
+                    s->checkpoint_valid = s->checkpoint.len > 0;
+                    s->mtp_draft_valid = false;
+                    return DS4_SESSION_SYNC_INTERRUPTED;
+                }
+                const int rc = qwen35_session_forward(
+                        &e->model, &e->weights, s->qwen35_state,
+                        (uint32_t)prompt->v[i],
+                        (uint32_t)i, s->logits);
+                if (rc != 0) {
+                    snprintf(err, errlen,
+                             "qwen35moe prefill failed at token %d", i);
+                    s->checkpoint_valid = s->checkpoint.len > 0;
+                    return 1;
+                }
+                token_vec_push(&s->checkpoint, prompt->v[i]);
+                if (s->progress) {
+                    s->progress(s->progress_ud, "prefill_chunk", i + 1,
+                                prompt->len);
+                }
+            }
+            s->checkpoint_valid = true;
+            s->mtp_draft_valid = false;
+            s->greedy_splitkv_segment.len = 0;
+            s->greedy_splitkv_anchor_valid = false;
+            return 0;
+        }
         if (s->checkpoint_valid &&
             prompt->len >= s->checkpoint.len &&
             ds4_tokens_starts_with(prompt, &s->checkpoint))
@@ -68254,6 +68331,23 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     }
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
+        if (s->qwen35_state) {
+            const int rc = qwen35_session_forward(
+                    &e->model, &e->weights, s->qwen35_state,
+                    (uint32_t)token,
+                    (uint32_t)s->checkpoint.len, s->logits);
+            if (rc != 0) {
+                snprintf(err, errlen, "qwen35moe decode failed at pos %d",
+                         s->checkpoint.len);
+                s->checkpoint_valid = false;
+                return 1;
+            }
+            token_vec_push(&s->checkpoint, token);
+            s->checkpoint_valid = true;
+            s->mtp_draft_valid = false;
+            (void)probe_mtp;
+            return 0;
+        }
         forward_token_raw_swa_cpu_decode_scratch(s->logits,
                                                  &e->model,
                                                  &e->weights,
@@ -75105,7 +75199,7 @@ typedef struct {
     const float *ffn_down_shexp;     /* [n_embd][n_ff_exp] */
 } qwen35_layer_cache;
 
-typedef struct {
+struct qwen35_session_state {
     uint32_t ctx_size;     /* allocated positions of K/V per full block */
     uint32_t len;          /* positions consumed so far */
     uint32_t n_full;       /* full-attention block slots */
@@ -75134,7 +75228,7 @@ typedef struct {
     float *expert_gate;    /* [n_ff_exp][n_embd] */
     float *expert_up;      /* [n_ff_exp][n_embd] */
     float *expert_down;    /* [n_embd][n_ff_exp] */
-} qwen35_session_state;
+};
 
 static uint32_t qwen35_session_full_blocks(void) {
     uint32_t n = 0;
