@@ -54348,6 +54348,16 @@ void qwen35_session_state_reset(qwen35_session_state *st);
 int qwen35_session_forward(const ds4_model *m, const ds4_weights *w,
                            qwen35_session_state *st, uint32_t token,
                            uint32_t pos, float *logits);
+/* The qwen35moe state is not snapshotted per position, so a rewind or an
+ * invalidate cannot restore it in place.  These reconcile it against the
+ * token checkpoint before the next forward: `has_pos` tests whether it already
+ * holds `pos` positions, and `replay` resets it and replays the checkpoint
+ * prefix to `pos` when it does not. */
+bool qwen35_session_state_has_pos(const qwen35_session_state *st, uint32_t pos);
+int qwen35_session_state_replay(const ds4_model *m, const ds4_weights *w,
+                                qwen35_session_state *st,
+                                const ds4_tokens *checkpoint, uint32_t pos,
+                                float *logits, char *err, size_t errlen);
 
 struct ds4_session {
     ds4_engine *engine;
@@ -66452,7 +66462,9 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             int start = 0;
             if (s->checkpoint_valid &&
                 prompt->len >= s->checkpoint.len &&
-                ds4_tokens_starts_with(prompt, &s->checkpoint))
+                ds4_tokens_starts_with(prompt, &s->checkpoint) &&
+                qwen35_session_state_has_pos(s->qwen35_state,
+                                             (uint32_t)s->checkpoint.len))
             {
                 start = s->checkpoint.len;
             } else {
@@ -68332,6 +68344,16 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
         if (s->qwen35_state) {
+            /* A rewind or invalidate may have dropped the state (qwen35moe has
+             * no per-position snapshot); rebuild it from the checkpoint before
+             * decoding so the forward sees a matching length. */
+            if (qwen35_session_state_replay(
+                    &e->model, &e->weights, s->qwen35_state, &s->checkpoint,
+                    (uint32_t)s->checkpoint.len, s->logits,
+                    err, errlen) != 0) {
+                s->checkpoint_valid = false;
+                return 1;
+            }
             const int rc = qwen35_session_forward(
                     &e->model, &e->weights, s->qwen35_state,
                     (uint32_t)token,
@@ -75506,6 +75528,43 @@ int qwen35_session_forward(const ds4_model *m, const ds4_weights *w,
     return 0;
 }
 
+bool qwen35_session_state_has_pos(const qwen35_session_state *st,
+                                  uint32_t pos) {
+    return st && st->len == pos;
+}
+
+int qwen35_session_state_replay(const ds4_model *m, const ds4_weights *w,
+                                qwen35_session_state *st,
+                                const ds4_tokens *checkpoint, uint32_t pos,
+                                float *logits, char *err, size_t errlen) {
+    if (!st) return 1;
+    if (st->len == pos) return 0;
+    if (!checkpoint || (uint32_t)checkpoint->len < pos) {
+        if (errlen) {
+            snprintf(err, errlen,
+                     "qwen35moe cannot restore position %u from checkpoint %d",
+                     pos, checkpoint ? checkpoint->len : 0);
+        }
+        return 1;
+    }
+    /* Drop the consumed history and replay the checkpoint prefix.  The result
+     * is the K/V and GDN state a forward over the same prefix would have
+     * produced, so the next forward at `pos` sees a matching length. */
+    qwen35_session_state_reset(st);
+    for (uint32_t i = 0; i < pos; i++) {
+        const int rc = qwen35_session_forward(
+                m, w, st, (uint32_t)checkpoint->v[i], i, logits);
+        if (rc != 0) {
+            if (errlen) {
+                snprintf(err, errlen,
+                         "qwen35moe rewind replay failed at token %u", i);
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
 #ifdef DS4_TEST_HOOKS
 /* Engine-tier test entry: load the model/weights once, hold them across the
  * whole token sequence, and call the production forward (never re-opening the
@@ -75539,6 +75598,75 @@ int ds4_test_qwen35_session_run(const char *gguf, const uint32_t *tokens,
         if (rc != 0) break;
     }
 
+    qwen35_session_state_free(st);
+    model_close(&m);
+    return rc;
+}
+
+/* Engine-tier test entry for the rewind fallback.  Advances the persistent
+ * state over the whole `checkpoint`, drops it exactly as `ds4_session_rewind`
+ * now does, rebuilds it to `rewind_to` with the checkpoint replay, and then
+ * forwards `continuation`.  The returned logits must equal a straight forward
+ * over checkpoint[0..rewind_to) followed by `continuation`, which is the
+ * property the rewind fix exists to preserve. */
+int ds4_test_qwen35_session_rewind_run(const char *gguf,
+                                       const uint32_t *checkpoint,
+                                       uint32_t checkpoint_len,
+                                       uint32_t rewind_to,
+                                       uint32_t continuation,
+                                       float *logits_out) {
+    if (!gguf || !checkpoint || checkpoint_len == 0 || !logits_out ||
+        rewind_to > checkpoint_len) {
+        return 1;
+    }
+
+    ds4_model m;
+    memset(&m, 0, sizeof(m));
+    m.fd = -1;
+    ds4_weights w;
+    memset(&w, 0, sizeof(w));
+
+    model_open(&m, gguf, false, false);
+    config_validate_model(&m);
+    weights_bind(&w, &m, false, 0, 0, true, false);
+
+    qwen35_session_state *st = qwen35_session_state_create(checkpoint_len + 1u);
+    if (!st) {
+        model_close(&m);
+        return 1;
+    }
+
+    int *cp_v = malloc((size_t)checkpoint_len * sizeof(int));
+    if (!cp_v) {
+        qwen35_session_state_free(st);
+        model_close(&m);
+        return 1;
+    }
+    for (uint32_t i = 0; i < checkpoint_len; i++) {
+        cp_v[i] = (int)checkpoint[i];
+    }
+    ds4_tokens cp;
+    cp.v = cp_v;
+    cp.len = (int)checkpoint_len;
+    cp.cap = (int)checkpoint_len;
+
+    int rc = 0;
+    for (uint32_t t = 0; t < checkpoint_len; t++) {
+        rc = qwen35_session_forward(&m, &w, st, checkpoint[t], st->len,
+                                    logits_out);
+        if (rc != 0) break;
+    }
+    if (rc == 0) {
+        qwen35_session_state_reset(st);
+        rc = qwen35_session_state_replay(&m, &w, st, &cp, rewind_to,
+                                         logits_out, NULL, 0);
+    }
+    if (rc == 0) {
+        rc = qwen35_session_forward(&m, &w, st, continuation, st->len,
+                                    logits_out);
+    }
+
+    free(cp_v);
     qwen35_session_state_free(st);
     model_close(&m);
     return rc;
@@ -76584,6 +76712,11 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_images = NULL;
     s->checkpoint_image_count = 0;
     ds4_session_dspark_capture_invalidate(s);
+    if (s->qwen35_state) {
+        /* qwen35moe holds no per-position snapshot, so drop its state; the next
+         * sync or decode replays the (empty) checkpoint. */
+        qwen35_session_state_reset(s->qwen35_state);
+    }
 #ifndef DS4_NO_GPU
     ds4_session_glm_reset_dense_cache(s);
 #endif
@@ -76606,6 +76739,12 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     s->checkpoint.len = pos;
     s->mtp_draft_valid = false;
     ds4_session_dspark_capture_invalidate(s);
+    if (s->qwen35_state) {
+        /* qwen35moe holds no per-position snapshot, so it cannot be rewound in
+         * place.  Drop it and let the next sync or decode replay the checkpoint
+         * up to pos; `qwen35_session_state_has_pos` detects the mismatch. */
+        qwen35_session_state_reset(s->qwen35_state);
+    }
 #ifndef DS4_NO_GPU
     s->glm_mtp_have = 0;
     s->glm_mtp_rollback_valid = false;

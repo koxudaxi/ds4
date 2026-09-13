@@ -44,6 +44,12 @@ int ds4_test_qwen35_forward_logits_ref(const char *gguf, const uint32_t *tokens,
                                        uint32_t n_steps,
                                        float *logits_out,
                                        uint32_t *greedy_out);
+int ds4_test_qwen35_session_rewind_run(const char *gguf,
+                                       const uint32_t *checkpoint,
+                                       uint32_t checkpoint_len,
+                                       uint32_t rewind_to,
+                                       uint32_t continuation,
+                                       float *logits_out);
 
 /* DS4_SHAPE_ORNITH15 n_vocab / geometry. */
 #define ORNITH_N_VOCAB 248320u
@@ -104,14 +110,26 @@ int main(void) {
      * scratch overran the heap. */
     const uint32_t long_tokens[7] = { 16u, 17u, 18u, 19u, 20u, 21u, 22u };
 
+    /* Rewind fallback: the session advanced over a five-token checkpoint, then
+     * dropped its state exactly as ds4_session_rewind does and rebuilt it to
+     * position 2 by replaying the checkpoint prefix.  The continuation token's
+     * logits must match a straight forward over the first three tokens. */
+    const uint32_t rewind_checkpoint[5] = { 16u, 17u, 18u, 19u, 20u };
+    const uint32_t rewind_prefix[3] = { 16u, 17u, 18u };
+
     float *ref = calloc(ORNITH_N_VOCAB, sizeof(float));
     float *sess = calloc(ORNITH_N_VOCAB, sizeof(float));
     float *plant = calloc(ORNITH_N_VOCAB, sizeof(float));
     float *ref_long = calloc(ORNITH_N_VOCAB, sizeof(float));
     float *sess_long = calloc(ORNITH_N_VOCAB, sizeof(float));
+    float *ref_rewind = calloc(ORNITH_N_VOCAB, sizeof(float));
+    float *sess_rewind = calloc(ORNITH_N_VOCAB, sizeof(float));
     uint32_t ref_greedy = 0;
     uint32_t long_greedy = 0;
-    if (!ref || !sess || !plant || !ref_long || !sess_long) return 2;
+    if (!ref || !sess || !plant || !ref_long || !sess_long ||
+        !ref_rewind || !sess_rewind) {
+        return 2;
+    }
 
     printf("model: %s\n", model);
     printf("tokens: %u %u\n", tokens[0], tokens[1]);
@@ -158,26 +176,50 @@ int main(void) {
         return 1;
     }
 
+    const int rwref = ds4_test_qwen35_session_run(model, rewind_prefix, 3u, false,
+                                                  ref_rewind);
+    double t6 = now_secs();
+    if (rwref != 0) {
+        fprintf(stderr, "FAIL: rewind reference forward rc=%d\n", rwref);
+        return 1;
+    }
+
+    const int rwfix = ds4_test_qwen35_session_rewind_run(
+            model, rewind_checkpoint, 5u, 2u, 18u, sess_rewind);
+    double t7 = now_secs();
+    if (rwfix != 0) {
+        fprintf(stderr, "FAIL: rewind replay forward rc=%d\n", rwfix);
+        return 1;
+    }
+
     const float ref_vs_sess = max_abs_diff(ref, sess, ORNITH_N_VOCAB);
     const float ref_vs_plant = max_abs_diff(ref, plant, ORNITH_N_VOCAB);
     const float long_vs_ref = max_abs_diff(ref_long, sess_long, ORNITH_N_VOCAB);
+    const float rewind_diff = max_abs_diff(ref_rewind, sess_rewind, ORNITH_N_VOCAB);
     const uint32_t ref_arg = argmax(ref, ORNITH_N_VOCAB);
     const uint32_t sess_arg = argmax(sess, ORNITH_N_VOCAB);
     const uint32_t long_ref_arg = argmax(ref_long, ORNITH_N_VOCAB);
     const uint32_t long_sess_arg = argmax(sess_long, ORNITH_N_VOCAB);
+    const uint32_t rewind_ref_arg = argmax(ref_rewind, ORNITH_N_VOCAB);
+    const uint32_t rewind_fix_arg = argmax(sess_rewind, ORNITH_N_VOCAB);
 
     printf("reference forward: %.1fs, session: %.1fs, reset plant: %.1fs\n",
            t1 - t0, t2 - t1, t3 - t2);
     printf("long reference: %.1fs, long session: %.1fs\n", t4 - t3, t5 - t4);
+    printf("rewind reference: %.1fs, rewind replay: %.1fs\n", t6 - t5, t7 - t6);
     printf("second-token argmax: reference %u, session %u\n", ref_arg, sess_arg);
     printf("seventh-token argmax: reference %u, session %u\n",
            long_ref_arg, long_sess_arg);
+    printf("rewind argmax: reference %u, replay %u\n",
+           rewind_ref_arg, rewind_fix_arg);
     printf("|session - reference|_inf = %.9g (bound %.1e)\n",
            ref_vs_sess, SESSION_EQUAL_BOUND);
     printf("|reset   - reference|_inf = %.9g (min  %.1e)\n",
            ref_vs_plant, SESSION_DIVERGE_MIN);
     printf("|long    - reference|_inf = %.9g (bound %.1e)\n",
            long_vs_ref, SESSION_EQUAL_BOUND);
+    printf("|rewind  - reference|_inf = %.9g (bound %.1e)\n",
+           rewind_diff, SESSION_EQUAL_BOUND);
 
     int failed = 0;
     if (ref_vs_sess > SESSION_EQUAL_BOUND) {
@@ -200,8 +242,17 @@ int main(void) {
         printf("FAIL: seventh-token argmax differs\n");
         failed = 1;
     }
+    if (rewind_diff > SESSION_EQUAL_BOUND) {
+        printf("FAIL: rewind replay does not match a straight forward\n");
+        failed = 1;
+    }
+    if (rewind_ref_arg != rewind_fix_arg) {
+        printf("FAIL: rewind argmax differs\n");
+        failed = 1;
+    }
     if (failed) {
         free(ref); free(sess); free(plant); free(ref_long); free(sess_long);
+        free(ref_rewind); free(sess_rewind);
         return 1;
     }
     printf("PASS: persistent session matches the O4 forward; reset breaks it\n");
@@ -210,5 +261,7 @@ int main(void) {
     free(plant);
     free(ref_long);
     free(sess_long);
+    free(ref_rewind);
+    free(sess_rewind);
     return 0;
 }
