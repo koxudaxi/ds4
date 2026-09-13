@@ -53474,6 +53474,61 @@ static int generate_glm_metal_argmax(
  * linear layer.  The graph never touches the CPU layer math.
  * ========================================================================= */
 
+/* Opt-in decode stage profiler (DS4_METAL_QWEN35_PROFILE).  Each stage is
+ * encoded into its own command buffer and wall-timed at the boundary; the
+ * submit/wait adds synchronization that the normal single-command-buffer path
+ * does not pay, so the printed total is inflated by one boundary sync per
+ * stage.  The normal path is untouched: profile_mark is a no-op when the env
+ * is unset, so the command buffer is never split. */
+enum {
+    DS4_QWEN35_PROF_EMBED = 0,
+    DS4_QWEN35_PROF_FULL_NORM,
+    DS4_QWEN35_PROF_FULL_QKV,
+    DS4_QWEN35_PROF_FULL_QNORM,
+    DS4_QWEN35_PROF_FULL_ROPE,
+    DS4_QWEN35_PROF_FULL_KV,
+    DS4_QWEN35_PROF_FULL_ATTN,
+    DS4_QWEN35_PROF_FULL_GATE,
+    DS4_QWEN35_PROF_FULL_OUT,
+    DS4_QWEN35_PROF_LIN_NORM,
+    DS4_QWEN35_PROF_LIN_QKVZAB,
+    DS4_QWEN35_PROF_LIN_GDN,
+    DS4_QWEN35_PROF_LIN_OUT,
+    DS4_QWEN35_PROF_ATTN_RESIDUAL,
+    DS4_QWEN35_PROF_FFN_NORM,
+    DS4_QWEN35_PROF_MOE_ROUTER,
+    DS4_QWEN35_PROF_MOE_ROUTED,
+    DS4_QWEN35_PROF_MOE_SHARED,
+    DS4_QWEN35_PROF_MOE_RESIDUAL,
+    DS4_QWEN35_PROF_FINAL_NORM,
+    DS4_QWEN35_PROF_LM_HEAD,
+    DS4_QWEN35_PROF_STAGE_COUNT
+};
+
+static const char *const ds4_qwen35_prof_names[DS4_QWEN35_PROF_STAGE_COUNT] = {
+    "embed",
+    "full.pre_norm",
+    "full.qkv",
+    "full.q_norm",
+    "full.rope",
+    "full.kv_store",
+    "full.flash_attn",
+    "full.sigmoid_gate",
+    "full.out_proj",
+    "linear.pre_norm",
+    "linear.qkv_z_alpha_beta",
+    "linear.gdn_decode",
+    "linear.out_proj",
+    "attn_residual",
+    "ffn_norm",
+    "moe.router",
+    "moe.routed_experts",
+    "moe.shared_expert",
+    "moe_residual",
+    "final.norm",
+    "final.lm_head",
+};
+
 typedef struct ds4_qwen35_gpu_graph {
     const ds4_weights *weights;
     uint32_t ctx_size;
@@ -53527,6 +53582,12 @@ typedef struct ds4_qwen35_gpu_graph {
     ds4_gpu_tensor *layer_v_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_gdn_conv[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_gdn_rec[DS4_MAX_LAYER];
+
+    bool profile;
+    double profile_t0;
+    double profile_ms[DS4_QWEN35_PROF_STAGE_COUNT];
+    double profile_gpu_ms[DS4_QWEN35_PROF_STAGE_COUNT];
+    uint32_t profile_boundaries;
 } ds4_qwen35_gpu_graph;
 
 static void qwen35_graph_free(ds4_qwen35_gpu_graph *g) {
@@ -53578,6 +53639,7 @@ static bool qwen35_graph_alloc(ds4_qwen35_gpu_graph *g,
                                uint32_t ctx_size) {
     if (!g || !model || !weights || ctx_size == 0) return false;
     memset(g, 0, sizeof(*g));
+    g->profile = getenv("DS4_METAL_QWEN35_PROFILE") != NULL;
     g->weights = weights;
     g->ctx_size = ctx_size;
     g->n_exec = directional_steering_layer_count();
@@ -53738,6 +53800,53 @@ static bool qwen35_graph_reset(ds4_qwen35_gpu_graph *g) {
     return true;
 }
 
+/* Provided by ds4_metal.m for the opt-in qwen35 decode stage profiler. */
+extern double ds4_gpu_last_finish_gpu_ms(void);
+
+/* Boundary for the opt-in qwen35 decode stage profiler: submit and wait for
+ * the work emitted since the previous boundary, add its wall time and its GPU
+ * execution span to `stage`, and open a fresh command buffer.  No-op (and no
+ * command-buffer split) when the profiler is disabled, so the normal path
+ * stays one command buffer. */
+static bool qwen35_profile_mark(ds4_qwen35_gpu_graph *g, int stage) {
+    if (!g || !g->profile) return true;
+    if (stage < 0 || stage >= DS4_QWEN35_PROF_STAGE_COUNT) return false;
+    if (ds4_gpu_end_commands() == 0) return false;
+    const double now = now_sec();
+    g->profile_ms[stage] += (now - g->profile_t0) * 1000.0;
+    g->profile_gpu_ms[stage] += ds4_gpu_last_finish_gpu_ms();
+    g->profile_t0 = now;
+    g->profile_boundaries++;
+    return ds4_gpu_begin_commands() != 0;
+}
+
+static void qwen35_profile_print(const ds4_qwen35_gpu_graph *g,
+                                 uint32_t token,
+                                 uint32_t pos) {
+    if (!g || !g->profile) return;
+    double total = 0.0;
+    double gpu_total = 0.0;
+    for (int i = 0; i < DS4_QWEN35_PROF_STAGE_COUNT; i++) {
+        total += g->profile_ms[i];
+        gpu_total += g->profile_gpu_ms[i];
+    }
+    fprintf(stderr,
+            "ds4: qwen35 decode stage profile token=%u pos=%u wall_total=%.3f ms "
+            "gpu_total=%.3f ms boundaries=%u\n",
+            token, pos, total, gpu_total, g->profile_boundaries);
+    fprintf(stderr, "ds4:   %-22s %9s %8s %9s %8s\n",
+            "stage", "wall_ms", "wall_%", "gpu_ms", "gpu_%");
+    for (int i = 0; i < DS4_QWEN35_PROF_STAGE_COUNT; i++) {
+        if (g->profile_ms[i] <= 0.0 && g->profile_gpu_ms[i] <= 0.0) continue;
+        fprintf(stderr, "ds4:   %-22s %9.3f %7.2f%% %9.3f %7.2f%%\n",
+                ds4_qwen35_prof_names[i],
+                g->profile_ms[i],
+                total > 0.0 ? 100.0 * g->profile_ms[i] / total : 0.0,
+                g->profile_gpu_ms[i],
+                gpu_total > 0.0 ? 100.0 * g->profile_gpu_ms[i] / gpu_total : 0.0);
+    }
+}
+
 /* The CPU golden rejects a forward that produced any non-finite logit
  * (`qwen35_session_forward`).  The GPU graph must apply the same gate so a NaN
  * cannot silently reach argmax; the definition is below, with the CPU path. */
@@ -53766,6 +53875,12 @@ static bool qwen35_graph_forward_token(ds4_qwen35_gpu_graph *g,
     bool ok = true;
 
     if (!ds4_gpu_begin_commands()) return false;
+    if (g->profile) {
+        memset(g->profile_ms, 0, sizeof(g->profile_ms));
+        memset(g->profile_gpu_ms, 0, sizeof(g->profile_gpu_ms));
+        g->profile_boundaries = 0;
+        g->profile_t0 = now_sec();
+    }
     if (ok) ok = ds4_gpu_embed_token_quant_tensor(
                      g->cur,
                      map,
@@ -53775,9 +53890,11 @@ static bool qwen35_graph_forward_token(ds4_qwen35_gpu_graph *g,
                      (uint32_t)DS4_N_VOCAB,
                      token,
                      ne) != 0;
+    if (ok) ok = qwen35_profile_mark(g, DS4_QWEN35_PROF_EMBED);
 
     for (uint32_t il = 0; ok && il < g->n_exec; il++) {
         const ds4_layer_weights *l = &weights->layer[il];
+        const bool is_linear = ds4_qwen35moe_layer_is_linear(il);
         ok = ds4_gpu_rms_norm_weight_tensor(g->normed,
                                             g->cur,
                                             map,
@@ -53786,8 +53903,10 @@ static bool qwen35_graph_forward_token(ds4_qwen35_gpu_graph *g,
                                             ne,
                                             eps) != 0;
         if (!ok) break;
+        if (ok) ok = qwen35_profile_mark(g, is_linear
+                ? DS4_QWEN35_PROF_LIN_NORM : DS4_QWEN35_PROF_FULL_NORM);
 
-        if (!ds4_qwen35moe_layer_is_linear(il)) {
+        if (!is_linear) {
             ok = ds4_gpu_matmul_quant_tensor(g->q_gate,
                                              map,
                                              size,
@@ -53815,6 +53934,7 @@ static bool qwen35_graph_forward_token(ds4_qwen35_gpu_graph *g,
                                                      g->kv_dim,
                                                      g->normed,
                                                      1) != 0;
+            if (ok) ok = qwen35_profile_mark(g, DS4_QWEN35_PROF_FULL_QKV);
             if (ok) ok = ds4_gpu_qwen35_head_rms_norm_tensor(
                              g->q_gate,
                              map,
@@ -53833,6 +53953,7 @@ static bool qwen35_graph_forward_token(ds4_qwen35_gpu_graph *g,
                              hd,
                              (uint64_t)hd * sizeof(float),
                              eps) != 0;
+            if (ok) ok = qwen35_profile_mark(g, DS4_QWEN35_PROF_FULL_QNORM);
             if (ok) ok = ds4_gpu_qwen35_rope_neox_front_tensor(
                              g->q_gate,
                              1,
@@ -53853,6 +53974,7 @@ static bool qwen35_graph_forward_token(ds4_qwen35_gpu_graph *g,
                              (uint64_t)g->kv_dim * sizeof(float),
                              pos,
                              DS4_ROPE_FREQ_BASE) != 0;
+            if (ok) ok = qwen35_profile_mark(g, DS4_QWEN35_PROF_FULL_ROPE);
             if (ok) ok = ds4_gpu_tensor_copy(g->layer_k_cache[il],
                                              (uint64_t)pos * g->kv_dim * sizeof(float),
                                              g->k_buf,
@@ -53863,6 +53985,7 @@ static bool qwen35_graph_forward_token(ds4_qwen35_gpu_graph *g,
                                              g->v_buf,
                                              0,
                                              (uint64_t)g->kv_dim * sizeof(float)) != 0;
+            if (ok) ok = qwen35_profile_mark(g, DS4_QWEN35_PROF_FULL_KV);
             if (ok) ok = ds4_gpu_pack_slot_rows_f32_tensor(g->packed,
                                                            g->q_gate,
                                                            2,
@@ -53883,8 +54006,10 @@ static bool qwen35_graph_forward_token(ds4_qwen35_gpu_graph *g,
                              hd,
                              hd,
                              false) != 0;
+            if (ok) ok = qwen35_profile_mark(g, DS4_QWEN35_PROF_FULL_ATTN);
             if (ok) ok = ds4_gpu_sigmoid_tensor(g->sig, g->gate_packed, q_dim) != 0;
             if (ok) ok = ds4_gpu_mul_tensor(g->heads, g->heads, g->sig, q_dim) != 0;
+            if (ok) ok = qwen35_profile_mark(g, DS4_QWEN35_PROF_FULL_GATE);
             if (ok) ok = ds4_gpu_matmul_quant_tensor(g->attn_out,
                                                      map,
                                                      size,
@@ -53894,6 +54019,7 @@ static bool qwen35_graph_forward_token(ds4_qwen35_gpu_graph *g,
                                                      ne,
                                                      g->heads,
                                                      1) != 0;
+            if (ok) ok = qwen35_profile_mark(g, DS4_QWEN35_PROF_FULL_OUT);
         } else {
             ok = ds4_gpu_matmul_quant_tensor(g->qkv,
                                              map,
@@ -53931,6 +54057,7 @@ static bool qwen35_graph_forward_token(ds4_qwen35_gpu_graph *g,
                                                      (uint32_t)DS4_N_GDN_VALUE_HEAD,
                                                      g->normed,
                                                      1) != 0;
+            if (ok) ok = qwen35_profile_mark(g, DS4_QWEN35_PROF_LIN_QKVZAB);
             if (ok) ok = ds4_gpu_qwen35_gdn_decode_pre_out(
                              g->gdn_attn,
                              g->layer_gdn_conv[il],
@@ -53947,6 +54074,7 @@ static bool qwen35_graph_forward_token(ds4_qwen35_gpu_graph *g,
                              l->gdn_norm->abs_offset,
                              1,
                              eps) != 0;
+            if (ok) ok = qwen35_profile_mark(g, DS4_QWEN35_PROF_LIN_GDN);
             if (ok) ok = ds4_gpu_matmul_quant_tensor(
                              g->attn_out,
                              map,
@@ -53957,10 +54085,12 @@ static bool qwen35_graph_forward_token(ds4_qwen35_gpu_graph *g,
                              ne,
                              g->gdn_attn,
                              1) != 0;
+            if (ok) ok = qwen35_profile_mark(g, DS4_QWEN35_PROF_LIN_OUT);
         }
         if (!ok) break;
 
         ok = ds4_gpu_add_tensor(g->worked, g->cur, g->attn_out, ne) != 0;
+        if (ok) ok = qwen35_profile_mark(g, DS4_QWEN35_PROF_ATTN_RESIDUAL);
         if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->post,
                                                     g->worked,
                                                     map,
@@ -53968,6 +54098,7 @@ static bool qwen35_graph_forward_token(ds4_qwen35_gpu_graph *g,
                                                     l->ffn_norm->abs_offset,
                                                     ne,
                                                     eps) != 0;
+        if (ok) ok = qwen35_profile_mark(g, DS4_QWEN35_PROF_FFN_NORM);
 
         /* Router: softmax over all 256 experts, top-8, renormalised. */
         if (ok) ok = ds4_gpu_matmul_f32_tensor(g->router_logits,
@@ -53985,6 +54116,7 @@ static bool qwen35_graph_forward_token(ds4_qwen35_gpu_graph *g,
                                                      g->n_expert_used,
                                                      1.0f,
                                                      1) != 0;
+        if (ok) ok = qwen35_profile_mark(g, DS4_QWEN35_PROF_MOE_ROUTER);
         /* Expert strides are per layer: the down stacks mix Q4_K and Q6_K, so
          * they cannot be cached once from layer 0. */
         uint64_t gate_row_b = 0, gate_exp_b = 0;
@@ -54033,6 +54165,7 @@ static bool qwen35_graph_forward_token(ds4_qwen35_gpu_graph *g,
                          il,
                          g->post,
                          true) != 0;
+        if (ok) ok = qwen35_profile_mark(g, DS4_QWEN35_PROF_MOE_ROUTED);
 
         /* Shared expert: silu(gate_s.x) * up_s.x, down, sigmoid gate. */
         if (ok) ok = ds4_gpu_matmul_quant_tensor(g->sh_gate,
@@ -54082,9 +54215,11 @@ static bool qwen35_graph_forward_token(ds4_qwen35_gpu_graph *g,
                                                g->sh_dot,
                                                ne) != 0;
         if (ok) ok = ds4_gpu_add_tensor(g->moe_out, g->moe_out, g->sh_out, ne) != 0;
+        if (ok) ok = qwen35_profile_mark(g, DS4_QWEN35_PROF_MOE_SHARED);
 
         /* hidden = worked + moe_out */
         if (ok) ok = ds4_gpu_add_tensor(g->cur, g->worked, g->moe_out, ne) != 0;
+        if (ok) ok = qwen35_profile_mark(g, DS4_QWEN35_PROF_MOE_RESIDUAL);
     }
 
     if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->final_norm,
@@ -54094,6 +54229,7 @@ static bool qwen35_graph_forward_token(ds4_qwen35_gpu_graph *g,
                                                 weights->output_norm->abs_offset,
                                                 ne,
                                                 eps) != 0;
+    if (ok) ok = qwen35_profile_mark(g, DS4_QWEN35_PROF_FINAL_NORM);
     if (ok) ok = ds4_gpu_matmul_quant_tensor(g->logits,
                                              map,
                                              size,
@@ -54103,10 +54239,13 @@ static bool qwen35_graph_forward_token(ds4_qwen35_gpu_graph *g,
                                              (uint32_t)DS4_N_VOCAB,
                                              g->final_norm,
                                              1) != 0;
+    if (ok) ok = qwen35_profile_mark(g, DS4_QWEN35_PROF_LM_HEAD);
 
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
     if (!ok) return false;
+
+    if (g->profile) qwen35_profile_print(g, token, pos);
 
     if (ds4_gpu_tensor_read(g->logits, 0, logits_out,
                             (uint64_t)DS4_N_VOCAB * sizeof(float)) == 0) {

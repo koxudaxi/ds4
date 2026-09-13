@@ -990,6 +990,22 @@ static void ds4_gpu_close_batch_encoder(void) {
 static double g_gpu_busy_accum;
 static uint64_t g_gpu_busy_cbs;
 
+/* Opt-in qwen35 decode stage profiler support: after each finished command
+ * buffer, expose its GPU execution span (GPUEndTime - GPUStartTime) so ds4.c
+ * can attribute kernel time separately from the CPU submit/wait overhead that
+ * the wall-time boundary carries. */
+static double g_last_finish_gpu_ms;
+static int g_qwen35_profile_enabled = -1;
+static int ds4_gpu_qwen35_profile_enabled(void) {
+    if (g_qwen35_profile_enabled < 0) {
+        g_qwen35_profile_enabled = getenv("DS4_METAL_QWEN35_PROFILE") != NULL;
+    }
+    return g_qwen35_profile_enabled;
+}
+double ds4_gpu_last_finish_gpu_ms(void) {
+    return g_last_finish_gpu_ms;
+}
+
 /* A failed command buffer can leave a cross-threadgroup arrival counter at an
  * arbitrary partial value.  Drop cached ownership instead of CPU-resetting
  * buffers that another in-flight command buffer might still reference; bound
@@ -1213,6 +1229,9 @@ static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, con
     ds4_gpu_stream_expert_cache_note_owned_completed();
     [g_transient_buffers removeAllObjects];
     ds4_gpu_model_buffer_cache_maybe_evict(label);
+    if (ds4_gpu_qwen35_profile_enabled()) {
+        g_last_finish_gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+    }
     return ok;
 }
 
