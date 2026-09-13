@@ -49,6 +49,12 @@ enum {
     N_ROWS      = 3,
     REC_SIZE    = N_V * D_V * D_K,           /* 524288 */
     CONV_STATE  = (CONV_K - 1) * CONV_DIM,   /* 24576  */
+    /* One full row past the legal conv window.  The fixed kernel's last shift
+     * iteration could only reach here as an out-of-range row CONV-1; the guard
+     * detects any such write, or any shift loop that grows by a row.  (The old
+     * bug was an out-of-range *read* whose value was overwritten, so no guard
+     * pattern can observe it -- see the report.) */
+    CONV_GUARD  = CONV_DIM,
 
     /* Weight slots in the synthetic model map, 4096-byte aligned. */
     CONV1D_OFFSET  = 0,                        /* CONV_DIM * CONV_K floats */
@@ -72,6 +78,28 @@ static void require_close(const char *what, float actual, float expected,
         fprintf(stderr, "%s: got %.9g, expected %.9g (tolerance %.9g)\n",
                 what, actual, expected, tolerance);
         exit(1);
+    }
+}
+
+/* Sentinel written into the one-row guard region that follows the legal
+ * CONV_STATE floats of the conv tensor.  The kernel must never touch it. */
+static const float CONV_GUARD_SENTINEL = 1234567.0f;
+
+static void check_conv_guard(const ds4_gpu_tensor *g_conv, const char *what) {
+    static float guard[CONV_GUARD];
+    if (!ds4_gpu_tensor_read(g_conv, (uint64_t)CONV_STATE * sizeof(float),
+                             guard, sizeof(guard))) {
+        fprintf(stderr, "%s: conv guard read failed\n", what);
+        exit(1);
+    }
+    for (uint32_t i = 0; i < CONV_GUARD; i++) {
+        if (guard[i] != CONV_GUARD_SENTINEL) {
+            fprintf(stderr,
+                    "%s: conv guard[%u] = %.9g, expected %.9g (kernel touched "
+                    "memory past the conv state)\n",
+                    what, i, guard[i], CONV_GUARD_SENTINEL);
+            exit(1);
+        }
     }
 }
 
@@ -121,7 +149,7 @@ static void reference_core(const float *qkv, const float *z,
                            const float *alpha, const float *beta,
                            const float *conv1d, const float *a_log,
                            const float *dt_bias, const float *norm,
-                           const float *ssm_out, uint32_t n_rows,
+                           const float *ssm_out, uint32_t n_rows, float eps,
                            float *conv_state, float *rec, float *out) {
     float convout[CONV_DIM];
     float qn[N_V * D_K], kn[N_V * D_K];
@@ -152,7 +180,7 @@ static void reference_core(const float *qkv, const float *z,
             const float *qraw = convout + (uint64_t)h * D_K;
             double ss = 0.0;
             for (uint32_t d = 0; d < D_K; d++) ss += (double)qraw[d] * qraw[d];
-            const float qinv = 1.0f / sqrtf((float)ss + 1e-6f);
+            const float qinv = 1.0f / sqrtf((float)ss + eps);
             for (uint32_t vh = h; vh < N_V; vh += N_K)
                 for (uint32_t d = 0; d < D_K; d++)
                     qn[(uint64_t)vh * D_K + d] =
@@ -161,7 +189,7 @@ static void reference_core(const float *qkv, const float *z,
             const float *kraw = convout + (uint64_t)N_K * D_K + (uint64_t)h * D_K;
             ss = 0.0;
             for (uint32_t d = 0; d < D_K; d++) ss += (double)kraw[d] * kraw[d];
-            const float kinv = 1.0f / sqrtf((float)ss + 1e-6f);
+            const float kinv = 1.0f / sqrtf((float)ss + eps);
             for (uint32_t vh = h; vh < N_V; vh += N_K)
                 for (uint32_t d = 0; d < D_K; d++)
                     kn[(uint64_t)vh * D_K + d] = kraw[d] * kinv;
@@ -207,7 +235,7 @@ static void reference_core(const float *qkv, const float *z,
             for (uint32_t dv = 0; dv < D_V; dv++)
                 ss += (double)o[(uint64_t)vh * D_V + dv] *
                       o[(uint64_t)vh * D_V + dv];
-            const float inv = 1.0f / sqrtf((float)(ss / D_V) + 1e-6f);
+            const float inv = 1.0f / sqrtf((float)(ss / D_V) + eps);
             for (uint32_t dv = 0; dv < D_V; dv++) {
                 const uint64_t idx = (uint64_t)vh * D_V + dv;
                 on[idx] = o[idx] * inv * norm[dv] *
@@ -262,10 +290,23 @@ int main(void) {
     ds4_gpu_tensor *g_alpha = ds4_gpu_tensor_alloc((uint64_t)N_ROWS * N_V * sizeof(float));
     ds4_gpu_tensor *g_beta = ds4_gpu_tensor_alloc((uint64_t)N_ROWS * N_V * sizeof(float));
     ds4_gpu_tensor *g_out = ds4_gpu_tensor_alloc((uint64_t)N_ROWS * N_EMBD * sizeof(float));
-    ds4_gpu_tensor *g_conv = ds4_gpu_tensor_alloc((uint64_t)CONV_STATE * sizeof(float));
+    ds4_gpu_tensor *g_conv =
+        ds4_gpu_tensor_alloc((uint64_t)(CONV_STATE + CONV_GUARD) * sizeof(float));
     ds4_gpu_tensor *g_rec = ds4_gpu_tensor_alloc((uint64_t)REC_SIZE * sizeof(float));
     require_ok(g_qkv && g_z && g_alpha && g_beta && g_out && g_conv && g_rec,
                "tensor allocation");
+
+    /* Seed the guard row once.  Each case below zeroes only the legal
+     * CONV_STATE state region, so the guard survives to be checked. */
+    {
+        static float guard[CONV_GUARD];
+        for (uint32_t i = 0; i < CONV_GUARD; i++)
+            guard[i] = CONV_GUARD_SENTINEL;
+        require_ok(ds4_gpu_tensor_write(
+                       g_conv, (uint64_t)CONV_STATE * sizeof(float),
+                       guard, sizeof(guard)),
+                   "conv guard seed");
+    }
 
     /* The projected inputs a real layer would produce from the hidden state.
      * Nearly identical rows keep the key/value vectors aligned across
@@ -311,7 +352,7 @@ int main(void) {
         memset(cv_gpu, 0, sizeof(cv_gpu));
         float expect[N_EMBD], actual[N_EMBD];
         reference_core(qkv, z, alpha, beta, conv1d, a_log, dt_bias, norm,
-                       ssm_out, 1, cv_ref, st_ref, expect);
+                       ssm_out, 1, 1e-6f, cv_ref, st_ref, expect);
         require_ok(ds4_gpu_tensor_fill_f32(g_conv, 0.0f, CONV_STATE), "conv clear");
         require_ok(ds4_gpu_tensor_fill_f32(g_rec, 0.0f, REC_SIZE), "rec clear");
         require_ok(ds4_gpu_qwen35_gdn_decode(
@@ -322,9 +363,12 @@ int main(void) {
                    "gdn decode single token");
         require_ok(ds4_gpu_tensor_read(g_out, 0, actual, sizeof(actual)),
                    "output read");
+        check_conv_guard(g_conv, "single token");
+        fprintf(stderr, "qwen35 gdn metal: max output diff %.3g (single-token)\n",
+                max_abs_diff(actual, expect, N_EMBD));
         for (uint32_t d = 0; d < N_EMBD; d++)
             require_close("qwen35 gdn metal single token", actual[d], expect[d],
-                          3e-3f);
+                          1e-6f);
     }
 
     /* Three-token call: the kernel carries the conv window and the recurrent
@@ -339,7 +383,7 @@ int main(void) {
         float expect[(uint64_t)N_ROWS * N_EMBD];
         float actual[(uint64_t)N_ROWS * N_EMBD];
         reference_core(qkv, z, alpha, beta, conv1d, a_log, dt_bias, norm,
-                       ssm_out, N_ROWS, cv_ref, st_ref, expect);
+                       ssm_out, N_ROWS, 1e-6f, cv_ref, st_ref, expect);
         require_ok(ds4_gpu_tensor_fill_f32(g_conv, 0.0f, CONV_STATE), "conv reset");
         require_ok(ds4_gpu_tensor_fill_f32(g_rec, 0.0f, REC_SIZE), "rec reset");
         require_ok(ds4_gpu_qwen35_gdn_decode(
@@ -350,11 +394,14 @@ int main(void) {
                    "gdn decode three tokens");
         require_ok(ds4_gpu_tensor_read(g_out, 0, actual, sizeof(actual)),
                    "output read");
+        check_conv_guard(g_conv, "three tokens");
+        fprintf(stderr, "qwen35 gdn metal: max output diff %.3g (three-token)\n",
+                max_abs_diff(actual, expect, (uint64_t)N_ROWS * N_EMBD));
         for (uint32_t t = 0; t < N_ROWS; t++)
             for (uint32_t d = 0; d < N_EMBD; d++)
                 require_close("qwen35 gdn metal three tokens",
                               actual[(uint64_t)t * N_EMBD + d],
-                              expect[(uint64_t)t * N_EMBD + d], 3e-3f);
+                              expect[(uint64_t)t * N_EMBD + d], 1e-6f);
         require_ok(ds4_gpu_tensor_read(g_rec, 0, st_gpu,
                                        (uint64_t)REC_SIZE * sizeof(float)),
                    "recurrent state read");
@@ -375,7 +422,7 @@ int main(void) {
         memset(cv_ref, 0, sizeof(cv_ref));
         float expect[(uint64_t)N_ROWS * N_EMBD];
         reference_core(qkv, z, alpha, beta, conv1d, a_log, dt_bias, norm,
-                       ssm_out, N_ROWS, cv_ref, st_ref, expect);
+                       ssm_out, N_ROWS, 1e-6f, cv_ref, st_ref, expect);
 
         static float st_gpu[REC_SIZE], cv_gpu[CONV_STATE];
         memset(st_gpu, 0, sizeof(st_gpu));
@@ -409,11 +456,45 @@ int main(void) {
                            (uint64_t)N_EMBD * sizeof(float)),
                        "split output read");
         }
+        check_conv_guard(g_conv, "split call");
+        fprintf(stderr, "qwen35 gdn metal: max output diff %.3g (split)\n",
+                max_abs_diff(actual, expect, (uint64_t)N_ROWS * N_EMBD));
         for (uint32_t t = 0; t < N_ROWS; t++)
             for (uint32_t d = 0; d < N_EMBD; d++)
                 require_close("qwen35 gdn metal split call",
                               actual[(uint64_t)t * N_EMBD + d],
-                              expect[(uint64_t)t * N_EMBD + d], 3e-3f);
+                              expect[(uint64_t)t * N_EMBD + d], 1e-6f);
+    }
+
+    /* Epsilon is an argument, not a kernel constant: the CPU uses DS4_RMS_EPS
+     * for *both* the q/k L2 norm and the gated norm.  A deliberately large
+     * shared epsilon makes a hardcoded L2 epsilon impossible to miss. */
+    {
+        const float eps = 0.25f;
+        static float st_ref[REC_SIZE], cv_ref[CONV_STATE];
+        memset(st_ref, 0, sizeof(st_ref));
+        memset(cv_ref, 0, sizeof(cv_ref));
+        float expect[N_EMBD], actual[N_EMBD];
+        reference_core(qkv, z, alpha, beta, conv1d, a_log, dt_bias, norm,
+                       ssm_out, 1, eps, cv_ref, st_ref, expect);
+        require_ok(ds4_gpu_tensor_fill_f32(g_conv, 0.0f, CONV_STATE),
+                   "conv clear (epsilon)");
+        require_ok(ds4_gpu_tensor_fill_f32(g_rec, 0.0f, REC_SIZE),
+                   "rec clear (epsilon)");
+        require_ok(ds4_gpu_qwen35_gdn_decode(
+                       g_out, g_conv, g_rec, g_qkv, g_z, g_alpha, g_beta,
+                       model, MODEL_BYTES, CONV1D_OFFSET, A_LOG_OFFSET,
+                       DT_BIAS_OFFSET, NORM_OFFSET, SSM_OUT_OFFSET,
+                       1, eps),
+                   "gdn decode shared epsilon");
+        require_ok(ds4_gpu_tensor_read(g_out, 0, actual, sizeof(actual)),
+                   "output read (epsilon)");
+        check_conv_guard(g_conv, "shared epsilon");
+        fprintf(stderr, "qwen35 gdn metal: max output diff %.3g (eps=%.2g)\n",
+                max_abs_diff(actual, expect, N_EMBD), (double)eps);
+        for (uint32_t d = 0; d < N_EMBD; d++)
+            require_close("qwen35 gdn metal shared epsilon", actual[d],
+                          expect[d], 1e-6f);
     }
 
     free(beta);

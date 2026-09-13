@@ -17,7 +17,9 @@
 
 struct qwen35_gdn_args {
     uint n_rows;
-    float norm_eps;
+    float norm_eps;   /* RMSNormGated output gate epsilon */
+    float l2_eps;     /* per-head q/k L2-norm epsilon; CPU uses the same
+                       * DS4_RMS_EPS for both norms */
 };
 
 struct qwen35_gdn_out_args {
@@ -70,7 +72,12 @@ kernel void kernel_qwen35_gdn_conv(
         acc = fma(x, conv1d[(ulong)ch * QWEN35_GDN_CONV +
                             (QWEN35_GDN_CONV - 1u)], acc);
         convout[base + ch] = qwen35_gdn_silu(acc);
-        for (uint kk = 0; kk + 1u < QWEN35_GDN_CONV; kk++) {
+        /* The conv state holds exactly CONV-1 rows, so the oldest-first shift
+         * moves CONV-2 rows: rows 0..CONV-3 read rows 1..CONV-2.  The final
+         * row CONV-2 is overwritten with the new raw input.  Bounding at
+         * CONV-1 here (rather than CONV) is what keeps the last iteration from
+         * reading row CONV-1, which is past the end of the buffer. */
+        for (uint kk = 0; kk + 1u < QWEN35_GDN_CONV - 1u; kk++) {
             conv_state[(ulong)kk * QWEN35_GDN_CONVDIM + ch] =
                 conv_state[(ulong)(kk + 1u) * QWEN35_GDN_CONVDIM + ch];
         }
@@ -146,8 +153,8 @@ kernel void kernel_qwen35_gdn_core(
         q_total = simd_sum(q_total);
         k_total = simd_sum(k_total);
         if (tid < DK) {
-            sq[tid] *= rsqrt(q_total + 1.0e-6f) * 0.08838834764831845f;
-            sk[tid] *= rsqrt(k_total + 1.0e-6f);
+            sq[tid] *= rsqrt(q_total + args.l2_eps) * 0.08838834764831845f;
+            sk[tid] *= rsqrt(k_total + args.l2_eps);
         }
 
         const float gate = a * qwen35_gdn_softplus(

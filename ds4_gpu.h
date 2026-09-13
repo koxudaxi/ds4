@@ -3062,7 +3062,9 @@ int ds4_gpu_glm53_kda_prefill(
  * the kernel does the fused conv, the q/k L2 norm and 2:1 value-head
  * broadcast, the exp-softplus decay, the delta-rule recurrence, the
  * RMSNormGated * silu(z) gate and the ssm_out projection.  conv_state and
- * recurrent_state are the persistent per-layer FP32 buffers. */
+ * recurrent_state are the persistent per-layer FP32 buffers.  `norm_eps` is
+ * the caller's DS4_RMS_EPS: as in the CPU hook it feeds *both* the per-head
+ * q/k L2 norm and the RMSNormGated gate. */
 int ds4_gpu_qwen35_gdn_decode(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *conv_state,

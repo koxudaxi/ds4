@@ -44739,7 +44739,8 @@ int ds4_gpu_glm53_kda_prefill(
 
 typedef struct {
     uint32_t n_rows;
-    float norm_eps;
+    float norm_eps; /* RMSNormGated output gate epsilon */
+    float l2_eps;   /* per-head q/k L2-norm epsilon (CPU: same DS4_RMS_EPS) */
 } qwen35_gdn_args;
 
 typedef struct {
@@ -44840,6 +44841,9 @@ int ds4_gpu_qwen35_gdn_decode(
         qwen35_gdn_args args = {
             .n_rows = n_rows,
             .norm_eps = norm_eps,
+            /* The CPU hook uses DS4_RMS_EPS for both the L2 norm and the
+             * gated norm, so the single caller epsilon feeds both. */
+            .l2_eps = norm_eps,
         };
         qwen35_gdn_out_args out_args = {
             .in_dim = QWEN35_DINNER,
