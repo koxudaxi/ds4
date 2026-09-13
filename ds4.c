@@ -73817,11 +73817,147 @@ static void qwen35_attn_matvec_f32(
     matvec_f32(out, &m, &t, x);
 }
 
-/* Defined later in this file; declared here so the test hook can call it. */
-static void rope_tail_ext_inplace(float *x, uint32_t n_head, uint32_t head_dim,
-        uint32_t n_rot, uint32_t pos, uint64_t n_ctx_orig, float freq_base,
-        float freq_scale, float ext_factor, float attn_factor,
-        float beta_fast, float beta_slow, bool inverse);
+/* Partial RoPE over the first n_rot dims of one head, pairing (p, p+n_rot/2)
+ * and rotating by pos * freq_base^(-2p/n_rot).  This is what llama.cpp's
+ * ggml_rope_multi produces for qwen35moe's IMROPE mode at a text-only
+ * position; the engine's rope_tail_ext_inplace pairs adjacent dims in the
+ * tail, which does not match. */
+static void qwen35_rope_neox_front(
+        float    * x,
+        uint32_t   n_rot,
+        uint32_t   pos,
+        float      freq_base) {
+    if (n_rot == 0) return;
+    const uint32_t half = n_rot / 2u;
+    const float theta_scale = powf(freq_base, -2.0f / (float)n_rot);
+    float theta = (float)pos;
+    for (uint32_t p = 0; p < half; p++) {
+        const float c = cosf(theta);
+        const float s = sinf(theta);
+        const float x0 = x[p];
+        const float x1 = x[p + half];
+        x[p]        = x0 * c - x1 * s;
+        x[p + half] = x0 * s + x1 * c;
+        theta *= theta_scale;
+    }
+}
+
+/* The full-attention sublayer math on an already attn_normed input: joint
+ * per-head query+gate projection, GQA K/V, per-head q/k RMSNorm, partial NEOX
+ * RoPE at absolute position pos0+t, causal softmax, the sigmoid output gate
+ * and the output projection.  `attn_out` is the projection output; the
+ * residual and post-attention norm are the caller's. */
+static int qwen35_attn_core(
+        float                           * attn_out,
+        const float                     * normed,
+        const ds4_test_qwen35_attn_args * args,
+        uint32_t                          n_tokens,
+        uint32_t                          pos0) {
+    const uint32_t n_embd     = (uint32_t)DS4_N_EMBD;
+    const uint32_t n_head     = DS4_N_HEAD;
+    const uint32_t n_head_kv  = DS4_N_HEAD_KV;
+    const uint32_t head_dim   = (uint32_t)DS4_N_HEAD_DIM;
+    const uint32_t q_dim      = n_head * head_dim;
+    const uint32_t q_gate_dim = 2u * q_dim;
+    const uint32_t kv_dim     = n_head_kv * head_dim;
+    const uint32_t group      = n_head / n_head_kv;
+
+    if (group == 0 || n_head % n_head_kv != 0) return 1;
+    if (args->n_rot > head_dim || args->n_rot % 2u != 0u) return 1;
+
+    float *q      = xmalloc((size_t)n_tokens * q_gate_dim * sizeof(float));
+    float *k      = xmalloc((size_t)n_tokens * kv_dim * sizeof(float));
+    float *v      = xmalloc((size_t)n_tokens * kv_dim * sizeof(float));
+    float *ctx    = xmalloc((size_t)n_tokens * q_dim * sizeof(float));
+    float *scores = xmalloc((size_t)n_tokens * sizeof(float));
+
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const float *xt = normed + (uint64_t)t * n_embd;
+        qwen35_attn_matvec_f32(q + (uint64_t)t * q_gate_dim, args->attn_q,
+                               n_embd, q_gate_dim, xt);
+        qwen35_attn_matvec_f32(k + (uint64_t)t * kv_dim, args->attn_k,
+                               n_embd, kv_dim, xt);
+        qwen35_attn_matvec_f32(v + (uint64_t)t * kv_dim, args->attn_v,
+                               n_embd, kv_dim, xt);
+    }
+
+    /* Query and gate are interleaved per head: head h owns q at
+     * [h*2*head_dim, h*2*head_dim + head_dim) and the gate immediately after.
+     * Normalise q in place, then rotate its first n_rot dims. */
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        float *qt = q + (uint64_t)t * q_gate_dim;
+        for (uint32_t h = 0; h < n_head; h++) {
+            float *qh = qt + (uint64_t)h * 2u * head_dim;
+            rms_norm_weight(qh, qh, args->attn_q_norm, head_dim, DS4_RMS_EPS);
+            qwen35_rope_neox_front(qh, args->n_rot, pos0 + t, args->rope_freq_base);
+        }
+        float *kt = k + (uint64_t)t * kv_dim;
+        for (uint32_t h = 0; h < n_head_kv; h++) {
+            float *kh = kt + (uint64_t)h * head_dim;
+            rms_norm_weight(kh, kh, args->attn_k_norm, head_dim, DS4_RMS_EPS);
+            qwen35_rope_neox_front(kh, args->n_rot, pos0 + t, args->rope_freq_base);
+        }
+    }
+
+    const float scale = 1.0f / sqrtf((float)head_dim);
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t h = 0; h < n_head; h++) {
+            const uint32_t kv_head = h / group;
+            const float *qh =
+                q + (uint64_t)t * q_gate_dim + (uint64_t)h * 2u * head_dim;
+            float *ct = ctx + (uint64_t)t * q_dim + (uint64_t)h * head_dim;
+            float max_score = -FLT_MAX;
+            for (uint32_t s = 0; s <= t; s++) {
+                const float *kh =
+                    k + (uint64_t)s * kv_dim + (uint64_t)kv_head * head_dim;
+                double dot = 0.0;
+                for (uint32_t d = 0; d < head_dim; d++) {
+                    dot += (double)qh[d] * kh[d];
+                }
+                scores[s] = (float)dot * scale;
+                if (scores[s] > max_score) max_score = scores[s];
+            }
+            double denom = 0.0;
+            for (uint32_t s = 0; s <= t; s++) {
+                scores[s] = expf(scores[s] - max_score);
+                denom += scores[s];
+            }
+            for (uint32_t d = 0; d < head_dim; d++) {
+                double acc = 0.0;
+                for (uint32_t s = 0; s <= t; s++) {
+                    const float *vh =
+                        v + (uint64_t)s * kv_dim + (uint64_t)kv_head * head_dim;
+                    acc += ((double)scores[s] / denom) * vh[d];
+                }
+                ct[d] = (float)acc;
+            }
+        }
+    }
+
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const float *qt = q + (uint64_t)t * q_gate_dim;
+        float *ct = ctx + (uint64_t)t * q_dim;
+        for (uint32_t h = 0; h < n_head; h++) {
+            const float *gate = qt + (uint64_t)h * 2u * head_dim + head_dim;
+            float *ch = ct + (uint64_t)h * head_dim;
+            for (uint32_t d = 0; d < head_dim; d++) {
+                ch[d] *= 1.0f / (1.0f + expf(-gate[d]));
+            }
+        }
+    }
+
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        qwen35_attn_matvec_f32(attn_out + (uint64_t)t * n_embd, args->attn_output,
+                               q_dim, n_embd, ctx + (uint64_t)t * q_dim);
+    }
+
+    free(scores);
+    free(ctx);
+    free(v);
+    free(k);
+    free(q);
+    return 0;
+}
 
 int ds4_test_qwen35_attn_forward(const ds4_test_qwen35_attn_args *args) {
     if (!args || !args->attn_q || !args->attn_k || !args->attn_v ||
@@ -73850,29 +73986,11 @@ int ds4_test_qwen35_attn_forward(const ds4_test_qwen35_attn_args *args) {
     if (ds4_qwen35moe_layer_is_linear(args->il)) return 4;
 
     const uint64_t n_embd = DS4_N_EMBD;
-    const uint32_t n_head = DS4_N_HEAD;
-    const uint32_t n_head_kv = DS4_N_HEAD_KV;
-    const uint64_t head_dim = DS4_N_HEAD_DIM;
-    const uint64_t q_dim = (uint64_t)n_head * head_dim;
-    const uint64_t q_gate_dim = 2u * q_dim;
-    const uint64_t kv_dim = (uint64_t)n_head_kv * head_dim;
-    const uint32_t group = n_head / n_head_kv;
     const uint32_t n_tokens = args->n_tokens;
 
-    if (group == 0 || n_head % n_head_kv != 0) return 1;
-
-    /* Partial RoPE rotates the tail n_rot dims of each head in place; it must
-     * not exceed the head and must pair up. */
-    if (args->n_rot > head_dim || args->n_rot % 2u != 0u) return 1;
-
     float *normed = xmalloc((size_t)n_tokens * n_embd * sizeof(float));
-    float *q = xmalloc((size_t)n_tokens * q_gate_dim * sizeof(float));
-    float *k = xmalloc((size_t)n_tokens * kv_dim * sizeof(float));
-    float *v = xmalloc((size_t)n_tokens * kv_dim * sizeof(float));
-    float *context = xmalloc((size_t)n_tokens * q_dim * sizeof(float));
-    float *proj = xmalloc((size_t)n_embd * sizeof(float));
-    float *resid = xmalloc((size_t)n_embd * sizeof(float));
-    float *scores = xmalloc((size_t)n_tokens * sizeof(float));
+    float *attn   = xmalloc((size_t)n_tokens * n_embd * sizeof(float));
+    float *resid  = xmalloc((size_t)n_embd * sizeof(float));
 
     for (uint32_t t = 0; t < n_tokens; t++) {
         rms_norm_weight(normed + (uint64_t)t * n_embd,
@@ -73880,105 +73998,25 @@ int ds4_test_qwen35_attn_forward(const ds4_test_qwen35_attn_args *args) {
                         n_embd, DS4_RMS_EPS);
     }
 
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        const float *xt = normed + (uint64_t)t * n_embd;
-        qwen35_attn_matvec_f32(q + (uint64_t)t * q_gate_dim, args->attn_q,
-                               n_embd, q_gate_dim, xt);
-        qwen35_attn_matvec_f32(k + (uint64_t)t * kv_dim, args->attn_k,
-                               n_embd, kv_dim, xt);
-        qwen35_attn_matvec_f32(v + (uint64_t)t * kv_dim, args->attn_v,
-                               n_embd, kv_dim, xt);
-    }
-
-    /* Per-head q/k RMSNorm (attn_q_norm/attn_k_norm, [head_dim]) before RoPE,
-     * then plain partial RoPE over the tail n_rot of each head.  The gate half
-     * of attn_q begins at offset q_dim and is left untouched. */
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        float *qt = q + (uint64_t)t * q_gate_dim;
-        for (uint32_t h = 0; h < n_head; h++) {
-            rms_norm_weight(qt + (uint64_t)h * head_dim,
-                            qt + (uint64_t)h * head_dim, args->attn_q_norm,
-                            head_dim, DS4_RMS_EPS);
-        }
-        float *kt = k + (uint64_t)t * kv_dim;
-        for (uint32_t h = 0; h < n_head_kv; h++) {
-            rms_norm_weight(kt + (uint64_t)h * head_dim,
-                            kt + (uint64_t)h * head_dim, args->attn_k_norm,
-                            head_dim, DS4_RMS_EPS);
-        }
-        if (args->n_rot != 0) {
-            rope_tail_ext_inplace(qt, n_head, (uint32_t)head_dim, args->n_rot,
-                                  args->pos0 + t, 0, args->rope_freq_base,
-                                  1.0f, 0.0f, 1.0f, 0.0f, 0.0f, false);
-            rope_tail_ext_inplace(kt, n_head_kv, (uint32_t)head_dim,
-                                  args->n_rot, args->pos0 + t, 0,
-                                  args->rope_freq_base,
-                                  1.0f, 0.0f, 1.0f, 0.0f, 0.0f, false);
-        }
-    }
-
-    const float scale = 1.0f / sqrtf((float)head_dim);
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        for (uint32_t h = 0; h < n_head; h++) {
-            const uint64_t kv_head = h / group;
-            const float *qh =
-                q + (uint64_t)t * q_gate_dim + (uint64_t)h * head_dim;
-            float *ctx =
-                context + (uint64_t)t * q_dim + (uint64_t)h * head_dim;
-            float max_score = -FLT_MAX;
-            for (uint32_t s = 0; s <= t; s++) {
-                const float *kh = k + (uint64_t)s * kv_dim + kv_head * head_dim;
-                double dot = 0.0;
-                for (uint64_t d = 0; d < head_dim; d++) {
-                    dot += (double)qh[d] * kh[d];
-                }
-                scores[s] = (float)dot * scale;
-                if (scores[s] > max_score) max_score = scores[s];
-            }
-            double denom = 0.0;
-            for (uint32_t s = 0; s <= t; s++) {
-                scores[s] = expf(scores[s] - max_score);
-                denom += scores[s];
-            }
-            for (uint64_t d = 0; d < head_dim; d++) {
-                double acc = 0.0;
-                for (uint32_t s = 0; s <= t; s++) {
-                    const float *vh =
-                        v + (uint64_t)s * kv_dim + kv_head * head_dim;
-                    acc += ((double)scores[s] / denom) * vh[d];
-                }
-                ctx[d] = (float)acc;
-            }
-        }
-    }
-
-    /* Sigmoid output gate: the second half of attn_q scales the attention
-     * output elementwise before the output projection. */
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        const float *gate = q + (uint64_t)t * q_gate_dim + q_dim;
-        float *ctx = context + (uint64_t)t * q_dim;
-        for (uint64_t d = 0; d < q_dim; d++) {
-            ctx[d] *= 1.0f / (1.0f + expf(-gate[d]));
-        }
+    const int rc = qwen35_attn_core(attn, normed, args, n_tokens, args->pos0);
+    if (rc != 0) {
+        free(resid);
+        free(attn);
+        free(normed);
+        return rc;
     }
 
     for (uint32_t t = 0; t < n_tokens; t++) {
-        qwen35_attn_matvec_f32(proj, args->attn_output, q_dim, n_embd,
-                               context + (uint64_t)t * q_dim);
         for (uint64_t d = 0; d < n_embd; d++) {
-            resid[d] = args->x[(uint64_t)t * n_embd + d] + proj[d];
+            resid[d] = args->x[(uint64_t)t * n_embd + d] +
+                       attn[(uint64_t)t * n_embd + d];
         }
         rms_norm_weight(args->out + (uint64_t)t * n_embd, resid, args->ffn_norm,
                         n_embd, DS4_RMS_EPS);
     }
 
-    free(scores);
     free(resid);
-    free(proj);
-    free(context);
-    free(v);
-    free(k);
-    free(q);
+    free(attn);
     free(normed);
     return 0;
 }
@@ -74398,6 +74436,307 @@ int ds4_test_qwen35_gdn_forward(const ds4_test_qwen35_gdn_weights *w,
     free(z);
     free(qkv);
     return 0;
+}
+
+/* =========================================================================
+ * O4: qwen35moe CPU forward over the real GGUF.
+ * =========================================================================
+ *
+ * CPU-only, real weights.  The loader/binder supplies quantised tensors; this
+ * forward dequantises each layer's tensors to f32 once per layer, runs the
+ * corrected O1 attention core, the O2 gated-delta-net hook and the O3 MoE hook
+ * (so the sublayer math has exactly one home), then the final norm and the LM
+ * head.  Layer-major over the whole token sequence: equivalent to a causal
+ * prefill, so a single pass yields step-0 logits at the last prompt token.
+ * Incremental KV-cached decode is a later increment. */
+
+static uint64_t qwen35_row_bytes(const ds4_tensor *t) {
+    switch (t->type) {
+    case DS4_TENSOR_F32:  return t->dim[0] * 4u;
+    case DS4_TENSOR_F16:  return t->dim[0] * 2u;
+    case DS4_TENSOR_Q4_K: return (t->dim[0] / QK_K) * sizeof(block_q4_K);
+    case DS4_TENSOR_Q6_K: return (t->dim[0] / QK_K) * sizeof(block_q6_K);
+    default: ds4_die("qwen35 forward: unsupported tensor type");
+    }
+    return 0;
+}
+
+/* Dequantise one GGUF row (dim[0] elements) into `dst`. */
+static void qwen35_dequant_row(const ds4_tensor *t, const uint8_t *src, float *dst) {
+    const uint64_t n = t->dim[0];
+    switch (t->type) {
+    case DS4_TENSOR_F32:
+        memcpy(dst, src, (size_t)n * sizeof(float));
+        return;
+    case DS4_TENSOR_F16:
+        for (uint64_t i = 0; i < n; i++) dst[i] = f16_to_f32(((const uint16_t *)src)[i]);
+        return;
+    case DS4_TENSOR_Q4_K: {
+        if (n % QK_K != 0) ds4_die("qwen35 forward: unaligned Q4_K row");
+        const uint64_t blocks = n / QK_K;
+        const block_q4_K *b = (const block_q4_K *)src;
+        for (uint64_t i = 0; i < blocks; i++) {
+            const float d = f16_to_f32(b[i].d);
+            const float dmin = f16_to_f32(b[i].dmin);
+            float *yb = dst + i * QK_K;
+            for (uint32_t j = 0; j < QK_K / 32; j++) {
+                uint8_t sc = 0, m = 0;
+                q4_k_get_scale_min((int)j, b[i].scales, &sc, &m);
+                const uint32_t byte_off = (j >> 1) * 32;
+                const uint32_t shift = (j & 1) * 4;
+                const float scale = d * (float)sc;
+                const float minv = dmin * (float)m;
+                for (uint32_t l = 0; l < 32; l++) {
+                    const int q = (b[i].qs[byte_off + l] >> shift) & 0x0F;
+                    yb[j * 32 + l] = scale * (float)q - minv;
+                }
+            }
+        }
+        return;
+    }
+    case DS4_TENSOR_Q6_K: {
+        if (n % QK_K != 0) ds4_die("qwen35 forward: unaligned Q6_K row");
+        const uint64_t blocks = n / QK_K;
+        const block_q6_K *b = (const block_q6_K *)src;
+        for (uint64_t i = 0; i < blocks; i++) {
+            const float d = f16_to_f32(b[i].d);
+            const uint8_t *ql = b[i].ql;
+            const uint8_t *qh = b[i].qh;
+            const int8_t *scales = b[i].scales;
+            float *yb = dst + i * QK_K;
+            for (uint32_t n128 = 0; n128 < QK_K; n128 += 128) {
+                for (uint32_t l = 0; l < 32; l++) {
+                    const uint32_t is = l / 16u;
+                    const int q1 = ((int)(ql[l] & 0x0F) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                    const int q2 = ((int)(ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                    const int q3 = ((int)(ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                    const int q4 = ((int)(ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                    yb[n128 + l +  0] = d * (float)scales[is + 0] * (float)q1;
+                    yb[n128 + l + 32] = d * (float)scales[is + 2] * (float)q2;
+                    yb[n128 + l + 64] = d * (float)scales[is + 4] * (float)q3;
+                    yb[n128 + l + 96] = d * (float)scales[is + 6] * (float)q4;
+                }
+                ql += 64;
+                qh += 32;
+                scales += 8;
+            }
+        }
+        return;
+    }
+    default:
+        ds4_die("qwen35 forward: unsupported row type");
+    }
+}
+
+static float *qwen35_dequant_tensor(const ds4_model *m, const ds4_tensor *t) {
+    if (!t) return NULL;
+    float *out = xmalloc((size_t)t->elements * sizeof(float));
+    const uint8_t *base = tensor_data(m, t);
+    if (t->type == DS4_TENSOR_F32) {
+        memcpy(out, base, (size_t)t->elements * sizeof(float));
+        return out;
+    }
+    if (t->type == DS4_TENSOR_F16) {
+        for (uint64_t i = 0; i < t->elements; i++)
+            out[i] = f16_to_f32(((const uint16_t *)base)[i]);
+        return out;
+    }
+    if (t->type == DS4_TENSOR_Q4_K || t->type == DS4_TENSOR_Q6_K) {
+        const uint64_t in = t->dim[0];
+        const uint64_t row_bytes = qwen35_row_bytes(t);
+        const uint64_t rows = t->elements / in;
+        for (uint64_t r = 0; r < rows; r++)
+            qwen35_dequant_row(t, base + r * row_bytes, out + r * in);
+        return out;
+    }
+    ds4_die("qwen35 forward: unsupported tensor type");
+    return NULL;
+}
+
+static void qwen35_embed_row(const ds4_model *m, const ds4_tensor *emb,
+                             uint32_t token, float *dst) {
+    const uint8_t *base = tensor_data(m, emb);
+    qwen35_dequant_row(emb, base + (uint64_t)token * qwen35_row_bytes(emb), dst);
+}
+
+/* One causal prefill over `seq[0..len)`; writes step logits for the last
+ * position and its greedy token.  The four [cap][n_embd] scratch rows are the
+ * caller's. */
+static int qwen35_forward_prefill(
+        const ds4_model   * m,
+        const ds4_weights * w,
+        const uint32_t    * seq,
+        uint32_t            len,
+        uint32_t            n_vocab,
+        float             * logits_out,
+        uint32_t          * greedy_out,
+        float             * hidden,
+        float             * normed,
+        float             * worked,
+        float             * post) {
+    const uint32_t ne = (uint32_t)DS4_N_EMBD;
+    const uint32_t n_exec = directional_steering_layer_count();
+    const uint32_t n_v = DS4_N_GDN_VALUE_HEAD;
+    const uint32_t d_v = DS4_N_GDN_VALUE_DIM;
+    const uint32_t d_k = DS4_N_GDN_HEAD_DIM;
+    const uint32_t conv_dim = 2u * DS4_N_GDN_KEY_HEAD * d_k + n_v * d_v;
+    const uint32_t kconv = DS4_N_GDN_CONV;
+
+    for (uint32_t t = 0; t < len; t++)
+        qwen35_embed_row(m, w->token_embd, seq[t], hidden + (uint64_t)t * ne);
+
+    float *moe_buf = xmalloc((size_t)ne * sizeof(float));
+
+    for (uint32_t il = 0; il < n_exec; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+
+        for (uint32_t t = 0; t < len; t++)
+            rms_norm_weight(normed + (uint64_t)t * ne, hidden + (uint64_t)t * ne,
+                            tensor_data(m, l->attn_norm), ne, DS4_RMS_EPS);
+
+        if (!ds4_qwen35moe_layer_is_linear(il)) {
+            ds4_test_qwen35_attn_args a;
+            memset(&a, 0, sizeof(a));
+            a.attn_q       = qwen35_dequant_tensor(m, l->attn_q);
+            a.attn_k       = qwen35_dequant_tensor(m, l->attn_k);
+            a.attn_v       = qwen35_dequant_tensor(m, l->attn_v);
+            a.attn_output  = qwen35_dequant_tensor(m, l->attn_output);
+            a.attn_q_norm  = qwen35_dequant_tensor(m, l->attn_q_norm);
+            a.attn_k_norm  = qwen35_dequant_tensor(m, l->attn_k_norm);
+            a.n_rot        = DS4_N_ROT;
+            a.rope_freq_base = DS4_ROPE_FREQ_BASE;
+            const int rc = qwen35_attn_core(worked, normed, &a, len, 0);
+            free((void *)a.attn_q);       free((void *)a.attn_k);
+            free((void *)a.attn_v);       free((void *)a.attn_output);
+            free((void *)a.attn_q_norm);  free((void *)a.attn_k_norm);
+            if (rc != 0) { free(moe_buf); return rc; }
+        } else {
+            ds4_test_qwen35_gdn_weights g;
+            g.gdn_qkv     = qwen35_dequant_tensor(m, l->gdn_qkv);
+            g.gdn_conv1d  = qwen35_dequant_tensor(m, l->gdn_conv1d);
+            g.gdn_alpha   = qwen35_dequant_tensor(m, l->gdn_alpha);
+            g.gdn_beta    = qwen35_dequant_tensor(m, l->gdn_beta);
+            g.gdn_a_log   = qwen35_dequant_tensor(m, l->gdn_a_log);
+            g.gdn_dt_bias = qwen35_dequant_tensor(m, l->gdn_dt_bias);
+            g.gdn_norm    = qwen35_dequant_tensor(m, l->gdn_norm);
+            g.gdn_out     = qwen35_dequant_tensor(m, l->gdn_out);
+            g.gdn_z       = qwen35_dequant_tensor(m, l->gdn_z);
+            const uint64_t state_floats =
+                (uint64_t)n_v * d_v * d_k + (uint64_t)(kconv - 1u) * conv_dim;
+            float *state = xcalloc(state_floats, sizeof(float));
+            const int rc = ds4_test_qwen35_gdn_forward(&g, normed, len, state, worked);
+            free(state);
+            free((void *)g.gdn_qkv);     free((void *)g.gdn_conv1d);
+            free((void *)g.gdn_alpha);   free((void *)g.gdn_beta);
+            free((void *)g.gdn_a_log);   free((void *)g.gdn_dt_bias);
+            free((void *)g.gdn_norm);    free((void *)g.gdn_out);
+            free((void *)g.gdn_z);
+            if (rc != 0) { free(moe_buf); return rc; }
+        }
+
+        for (uint32_t t = 0; t < len; t++) {
+            const uint64_t off = (uint64_t)t * ne;
+            for (uint32_t d = 0; d < ne; d++) worked[off + d] += hidden[off + d];
+            rms_norm_weight(post + off, worked + off, tensor_data(m, l->ffn_norm),
+                            ne, DS4_RMS_EPS);
+        }
+
+        ds4_test_qwen35_moe_weights mw;
+        mw.ffn_gate_inp       = qwen35_dequant_tensor(m, l->ffn_gate_inp);
+        mw.ffn_gate_exps      = qwen35_dequant_tensor(m, l->ffn_gate_exps);
+        mw.ffn_up_exps        = qwen35_dequant_tensor(m, l->ffn_up_exps);
+        mw.ffn_down_exps      = qwen35_dequant_tensor(m, l->ffn_down_exps);
+        mw.ffn_gate_inp_shexp = qwen35_dequant_tensor(m, l->ffn_gate_inp_shexp);
+        mw.ffn_gate_shexp     = qwen35_dequant_tensor(m, l->ffn_gate_shexp);
+        mw.ffn_up_shexp       = qwen35_dequant_tensor(m, l->ffn_up_shexp);
+        mw.ffn_down_shexp     = qwen35_dequant_tensor(m, l->ffn_down_shexp);
+        for (uint32_t t = 0; t < len; t++) {
+            const int rc = ds4_test_qwen35_moe_forward(&mw, post + (uint64_t)t * ne,
+                                                       moe_buf);
+            if (rc != 0) {
+                free((void *)mw.ffn_gate_inp);  free((void *)mw.ffn_gate_exps);
+                free((void *)mw.ffn_up_exps);   free((void *)mw.ffn_down_exps);
+                free((void *)mw.ffn_gate_inp_shexp); free((void *)mw.ffn_gate_shexp);
+                free((void *)mw.ffn_up_shexp);  free((void *)mw.ffn_down_shexp);
+                free(moe_buf);
+                return rc;
+            }
+            const uint64_t off = (uint64_t)t * ne;
+            for (uint32_t d = 0; d < ne; d++) hidden[off + d] = worked[off + d] + moe_buf[d];
+        }
+        free((void *)mw.ffn_gate_inp);       free((void *)mw.ffn_gate_exps);
+        free((void *)mw.ffn_up_exps);        free((void *)mw.ffn_down_exps);
+        free((void *)mw.ffn_gate_inp_shexp); free((void *)mw.ffn_gate_shexp);
+        free((void *)mw.ffn_up_shexp);       free((void *)mw.ffn_down_shexp);
+    }
+    free(moe_buf);
+
+    float *fin = xmalloc((size_t)ne * sizeof(float));
+    rms_norm_weight(fin, hidden + (uint64_t)(len - 1u) * ne,
+                    tensor_data(m, w->output_norm), ne, DS4_RMS_EPS);
+    float *ow = qwen35_dequant_tensor(m, w->output);
+    qwen35_attn_matvec_f32(logits_out, ow, ne, n_vocab, fin);
+    free(ow);
+    free(fin);
+
+    uint32_t best = 0;
+    float bestv = logits_out[0];
+    for (uint32_t v = 1; v < n_vocab; v++) {
+        if (logits_out[v] > bestv) { bestv = logits_out[v]; best = v; }
+    }
+    *greedy_out = best;
+    return 0;
+}
+
+int ds4_test_qwen35_forward_logits(const char *gguf, const uint32_t *tokens,
+                                   uint32_t n_tokens, uint32_t n_steps,
+                                   float *logits_out, uint32_t *greedy_out) {
+    if (!gguf || !tokens || n_tokens == 0 || n_steps == 0 ||
+        !logits_out || !greedy_out) {
+        return 1;
+    }
+
+    ds4_model m;
+    memset(&m, 0, sizeof(m));
+    m.fd = -1;
+    ds4_weights w;
+    memset(&w, 0, sizeof(w));
+
+    model_open(&m, gguf, false, false);
+    config_validate_model(&m);
+    weights_bind(&w, &m, false, 0, 0, true, false);
+
+    const uint32_t ne = (uint32_t)DS4_N_EMBD;
+    const uint32_t n_vocab = (uint32_t)DS4_N_VOCAB;
+    const uint32_t cap = n_tokens + n_steps;
+    uint32_t *seq = xmalloc((size_t)cap * sizeof(uint32_t));
+    memcpy(seq, tokens, (size_t)n_tokens * sizeof(uint32_t));
+    uint32_t len = n_tokens;
+
+    float *hidden = xmalloc((size_t)cap * ne * sizeof(float));
+    float *normed = xmalloc((size_t)cap * ne * sizeof(float));
+    float *worked = xmalloc((size_t)cap * ne * sizeof(float));
+    float *post   = xmalloc((size_t)cap * ne * sizeof(float));
+
+    int rc = 0;
+    for (uint32_t s = 0; s < n_steps; s++) {
+        rc = qwen35_forward_prefill(&m, &w, seq, len, n_vocab,
+                                    logits_out + (size_t)s * n_vocab,
+                                    &greedy_out[s], hidden, normed, worked, post);
+        if (rc != 0) break;
+        if (s + 1u < n_steps) {
+            if (len >= cap) { rc = 1; break; }
+            seq[len++] = greedy_out[s];
+        }
+    }
+
+    free(post);
+    free(worked);
+    free(normed);
+    free(hidden);
+    free(seq);
+    model_close(&m);
+    return rc;
 }
 #endif
 

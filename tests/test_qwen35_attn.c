@@ -106,25 +106,27 @@ static float rms_norm_one(const float *x, const float *weight, uint64_t n,
     return scale;
 }
 
-/* Plain partial RoPE: rotate only the tail N_ROT of each head, in place, at
- * position pos.  Mirrors the engine's rope_tail_ext_inplace with a text
- * (non-YaRN) configuration: freq_scale = 1, ext_factor = 0, attn_factor = 1.
- * The first head_dim-n_rot dims are never touched. */
-static void rope_tail_one(float *x, uint32_t n_head, uint32_t head_dim,
-                          uint32_t n_rot, uint32_t pos, float freq_base) {
-    const uint32_t n_nope = head_dim - n_rot;
+/* Partial RoPE over the first N_ROT dims of each head, Neox pairing: pair
+ * (p, p + n_rot/2) rotated by pos * freq_base^(-2p/n_rot).  This is what
+ * llama.cpp's ggml_rope_multi does for qwen35moe's IMROPE mode at a text-only
+ * position.  `stride` is the per-head stride (2*HEAD_DIM for the interleaved
+ * query+gate projection, HEAD_DIM for K). */
+static void rope_neox_front_one(float *x, uint32_t n_head, uint32_t stride,
+                                uint32_t n_rot, uint32_t pos, float freq_base) {
+    if (n_rot == 0) return;
+    const uint32_t half = n_rot / 2u;
     const float theta_scale = powf(freq_base, -2.0f / (float)n_rot);
     for (uint32_t h = 0; h < n_head; h++) {
-        float *tail = x + (uint64_t)h * head_dim + n_nope;
-        float theta_extrap = (float)pos;
-        for (uint32_t i = 0; i < n_rot; i += 2) {
-            const float c = cosf(theta_extrap);
-            const float s = sinf(theta_extrap);
-            const float x0 = tail[i + 0];
-            const float x1 = tail[i + 1];
-            tail[i + 0] = x0 * c - x1 * s;
-            tail[i + 1] = x0 * s + x1 * c;
-            theta_extrap *= theta_scale;
+        float *head = x + (uint64_t)h * stride;
+        float theta = (float)pos;
+        for (uint32_t p = 0; p < half; p++) {
+            const float c = cosf(theta);
+            const float s = sinf(theta);
+            const float x0 = head[p];
+            const float x1 = head[p + half];
+            head[p]        = x0 * c - x1 * s;
+            head[p + half] = x0 * s + x1 * c;
+            theta *= theta_scale;
         }
     }
 }
@@ -182,21 +184,23 @@ static void reference_layer(const float *wq, const float *wk, const float *wv,
         }
     }
 
-    /* Per-head q/k RMSNorm before RoPE, then plain partial RoPE on the tail. */
+    /* Query and gate are interleaved per head: head hd owns query at
+     * hd*2*HEAD_DIM and gate immediately after.  Normalise and rotate the
+     * query block in place; K is contiguous per head. */
     for (uint32_t t = 0; t < n_tokens; t++) {
         float *qt = q + (uint64_t)t * Q_GATE_DIM;
         for (uint32_t hd = 0; hd < N_HEAD; hd++)
-            rms_norm_one(qt + (uint64_t)hd * HEAD_DIM, cfg->q_norm, HEAD_DIM,
-                         qt + (uint64_t)hd * HEAD_DIM);
+            rms_norm_one(qt + (uint64_t)hd * 2 * HEAD_DIM, cfg->q_norm, HEAD_DIM,
+                         qt + (uint64_t)hd * 2 * HEAD_DIM);
         float *kt = k + (uint64_t)t * KV_DIM;
         for (uint32_t hd = 0; hd < N_HEAD_KV; hd++)
             rms_norm_one(kt + (uint64_t)hd * HEAD_DIM, cfg->k_norm, HEAD_DIM,
                          kt + (uint64_t)hd * HEAD_DIM);
         if (cfg->n_rot != 0) {
-            rope_tail_one(qt, N_HEAD, HEAD_DIM, cfg->n_rot, cfg->pos0 + t,
-                          cfg->rope_freq_base);
-            rope_tail_one(kt, N_HEAD_KV, HEAD_DIM, cfg->n_rot, cfg->pos0 + t,
-                          cfg->rope_freq_base);
+            rope_neox_front_one(qt, N_HEAD, 2 * HEAD_DIM, cfg->n_rot,
+                                cfg->pos0 + t, cfg->rope_freq_base);
+            rope_neox_front_one(kt, N_HEAD_KV, HEAD_DIM, cfg->n_rot,
+                                cfg->pos0 + t, cfg->rope_freq_base);
         }
     }
 
@@ -204,7 +208,7 @@ static void reference_layer(const float *wq, const float *wk, const float *wv,
     for (uint32_t t = 0; t < n_tokens; t++) {
         for (uint32_t hd = 0; hd < N_HEAD; hd++) {
             const uint32_t kv_head = hd / GROUP;
-            const float *qh = q + (uint64_t)t * Q_GATE_DIM + (uint64_t)hd * HEAD_DIM;
+            const float *qh = q + (uint64_t)t * Q_GATE_DIM + (uint64_t)hd * 2 * HEAD_DIM;
             float *ctx = context + (uint64_t)t * Q_DIM + (uint64_t)hd * HEAD_DIM;
             float scores[N_TOKENS];
             float max_score = -FLT_MAX;
@@ -239,10 +243,15 @@ static void reference_layer(const float *wq, const float *wk, const float *wv,
      * output elementwise before the output projection. */
     if (cfg->apply_gate) {
         for (uint32_t t = 0; t < n_tokens; t++) {
-            const float *gate = q + (uint64_t)t * Q_GATE_DIM + Q_DIM;
+            const float *qt = q + (uint64_t)t * Q_GATE_DIM;
             float *ct = context + (uint64_t)t * Q_DIM;
-            for (uint32_t j = 0; j < Q_DIM; j++)
-                ct[j] *= 1.0f / (1.0f + expf(-gate[j]));
+            for (uint32_t hd = 0; hd < N_HEAD; hd++) {
+                const float *gate =
+                    qt + (uint64_t)hd * 2 * HEAD_DIM + HEAD_DIM;
+                float *ch = ct + (uint64_t)hd * HEAD_DIM;
+                for (uint32_t d = 0; d < HEAD_DIM; d++)
+                    ch[d] *= 1.0f / (1.0f + expf(-gate[d]));
+            }
         }
     }
 
