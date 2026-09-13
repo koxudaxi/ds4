@@ -4338,6 +4338,7 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_GLM53_VISION_SOURCE", @"metal/glm53_vision.metal"],
         @[@"DS4_METAL_GLM53_KDA_SOURCE",  @"metal/glm53_kda.metal"],
         @[@"DS4_METAL_QWEN35_GDN_SOURCE", @"metal/qwen35_gdn.metal"],
+        @[@"DS4_METAL_QWEN35_ATTN_SOURCE", @"metal/qwen35_attn.metal"],
         @[@"DS4_METAL_MOE_SOURCE",        @"metal/moe.metal"],
         @[@"DS4_METAL_DSV4_HC_SOURCE",    @"metal/dsv4_hc.metal"],
         @[@"DS4_METAL_UNARY_SOURCE",      @"metal/unary.metal"],
@@ -33361,6 +33362,7 @@ static int ds4_gpu_glm_attention_flash_tensor_impl(
         uint32_t              cache_len,
         uint32_t              cache_cap,
         uint32_t              n_head,
+        uint32_t              n_head_kv,
         uint32_t              qk_dim,
         uint32_t              value_dim,
         bool                  cache_f16,
@@ -33368,7 +33370,8 @@ static int ds4_gpu_glm_attention_flash_tensor_impl(
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!heads || !q || !key_cache || !value_cache ||
         n_tokens == 0 || cache_len == 0 || cache_cap == 0 ||
-        n_head == 0 || qk_dim != 256u || value_dim != 256u ||
+        n_head == 0 || n_head_kv == 0 || n_head % n_head_kv != 0 ||
+        qk_dim != 256u || value_dim != 256u ||
         cache_len > cache_cap ||
         pos0 > cache_len || n_tokens > cache_len - pos0 ||
         cache_len > ds4_gpu_glm_flash_attention_max_cache_len()) {
@@ -33383,8 +33386,8 @@ static int ds4_gpu_glm_attention_flash_tensor_impl(
         const uint64_t heads_bytes = (uint64_t)n_tokens * n_head * value_dim * sizeof(float);
         const uint64_t q_bytes = (uint64_t)n_tokens * n_head * qk_dim * sizeof(float);
         const uint64_t cache_elem_bytes = cache_f16 ? sizeof(uint16_t) : sizeof(float);
-        const uint64_t key_bytes = (uint64_t)cache_cap * n_head * qk_dim * cache_elem_bytes;
-        const uint64_t value_bytes = (uint64_t)cache_cap * n_head * value_dim * cache_elem_bytes;
+        const uint64_t key_bytes = (uint64_t)cache_cap * n_head_kv * qk_dim * cache_elem_bytes;
+        const uint64_t value_bytes = (uint64_t)cache_cap * n_head_kv * value_dim * cache_elem_bytes;
         if (!headsbuf || !qbuf || !keybuf || !valbuf ||
             ds4_gpu_tensor_bytes(heads) < heads_bytes ||
             ds4_gpu_tensor_bytes(q) < q_bytes ||
@@ -33393,8 +33396,8 @@ static int ds4_gpu_glm_attention_flash_tensor_impl(
             fprintf(stderr, "ds4: Metal GLM FlashAttention received undersized buffers\n");
             return 0;
         }
-        const uint64_t key_elems = (uint64_t)cache_len * n_head * qk_dim;
-        const uint64_t value_elems = (uint64_t)cache_len * n_head * value_dim;
+        const uint64_t key_elems = (uint64_t)cache_len * n_head_kv * qk_dim;
+        const uint64_t value_elems = (uint64_t)cache_len * n_head_kv * value_dim;
         if (key_elems > UINT32_MAX || value_elems > UINT32_MAX) {
             return 0;
         }
@@ -33411,13 +33414,13 @@ static int ds4_gpu_glm_attention_flash_tensor_impl(
         const NSUInteger mask_bytes = (NSUInteger)n_tokens * (NSUInteger)cache_len * sizeof(uint16_t);
         const NSUInteger key_f16_offset = 0;
         const NSUInteger key_f16_bytes =
-            (NSUInteger)cache_len * (NSUInteger)n_head * q_row_bytes_f16;
+            (NSUInteger)cache_len * (NSUInteger)n_head_kv * q_row_bytes_f16;
         const NSUInteger value_f16_offset = key_f16_bytes;
         const NSUInteger value_f16_bytes =
-            (NSUInteger)cache_len * (NSUInteger)n_head * v_row_bytes_f16;
+            (NSUInteger)cache_len * (NSUInteger)n_head_kv * v_row_bytes_f16;
         const NSUInteger kv_f16_bytes = key_f16_bytes + value_f16_bytes;
         const NSUInteger pad_bytes = has_kvpad
-            ? (NSUInteger)ncpsg * ((NSUInteger)n_head * (q_row_bytes_f16 + v_row_bytes_f16) +
+            ? (NSUInteger)ncpsg * ((NSUInteger)n_head_kv * (q_row_bytes_f16 + v_row_bytes_f16) +
                                    (NSUInteger)n_tokens * sizeof(uint16_t))
             : 1u;
         const NSUInteger nblk0 = ((NSUInteger)cache_len + ncpsg - 1u) / ncpsg;
@@ -33477,8 +33480,8 @@ static int ds4_gpu_glm_attention_flash_tensor_impl(
                                                key_f16_offset,
                                                qk_dim,
                                                cache_len,
-                                               n_head,
-                                               (uint64_t)n_head * q_row_bytes_f16,
+                                               n_head_kv,
+                                               (uint64_t)n_head_kv * q_row_bytes_f16,
                                                q_row_bytes_f16,
                                                q_row_bytes_f16,
                                                (uint64_t)cache_len * q_row_bytes_f16) &&
@@ -33489,8 +33492,8 @@ static int ds4_gpu_glm_attention_flash_tensor_impl(
                                                value_f16_offset,
                                                value_dim,
                                                cache_len,
-                                               n_head,
-                                               (uint64_t)n_head * v_row_bytes_f16,
+                                               n_head_kv,
+                                               (uint64_t)n_head_kv * v_row_bytes_f16,
                                                v_row_bytes_f16,
                                                v_row_bytes_f16,
                                                (uint64_t)cache_len * v_row_bytes_f16)) :
@@ -33501,8 +33504,8 @@ static int ds4_gpu_glm_attention_flash_tensor_impl(
                                                key_f16_offset,
                                                qk_dim,
                                                cache_len,
-                                               n_head,
-                                               (uint64_t)n_head * q_row_bytes,
+                                               n_head_kv,
+                                               (uint64_t)n_head_kv * q_row_bytes,
                                                q_row_bytes,
                                                q_row_bytes_f16,
                                                (uint64_t)cache_len * q_row_bytes_f16) &&
@@ -33513,8 +33516,8 @@ static int ds4_gpu_glm_attention_flash_tensor_impl(
                                                value_f16_offset,
                                                value_dim,
                                                cache_len,
-                                               n_head,
-                                               (uint64_t)n_head * v_row_bytes,
+                                               n_head_kv,
+                                               (uint64_t)n_head_kv * v_row_bytes,
                                                v_row_bytes,
                                                v_row_bytes_f16,
                                                (uint64_t)cache_len * v_row_bytes_f16));
@@ -33526,14 +33529,14 @@ static int ds4_gpu_glm_attention_flash_tensor_impl(
         if (has_kvpad) {
             ds4_gpu_flash_attn_pad_args pad_args = {
                 .ne11 = (int32_t)cache_len,
-                .ne_12_2 = (int32_t)n_head,
+                .ne_12_2 = (int32_t)n_head_kv,
                 .ne_12_3 = 1,
                 .nb11 = q_row_bytes_f16,
                 .nb12 = (uint64_t)cache_len * q_row_bytes_f16,
-                .nb13 = (uint64_t)cache_len * (uint64_t)n_head * q_row_bytes_f16,
+                .nb13 = (uint64_t)cache_len * (uint64_t)n_head_kv * q_row_bytes_f16,
                 .nb21 = v_row_bytes_f16,
                 .nb22 = (uint64_t)cache_len * v_row_bytes_f16,
-                .nb23 = (uint64_t)cache_len * (uint64_t)n_head * v_row_bytes_f16,
+                .nb23 = (uint64_t)cache_len * (uint64_t)n_head_kv * v_row_bytes_f16,
                 .ne31 = (int32_t)n_tokens,
                 .ne32 = 1,
                 .ne33 = 1,
@@ -33549,7 +33552,7 @@ static int ds4_gpu_glm_attention_flash_tensor_impl(
             [enc setBuffer:g_flash_attn_kv_buffer offset:value_f16_offset atIndex:2];
             [enc setBuffer:mask_buffer offset:0 atIndex:3];
             [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:4];
-            [enc dispatchThreadgroups:MTLSizeMake(ncpsg, n_head, 1)
+            [enc dispatchThreadgroups:MTLSizeMake(ncpsg, n_head_kv, 1)
                  threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
         }
@@ -33582,16 +33585,16 @@ static int ds4_gpu_glm_attention_flash_tensor_impl(
             .nb02 = q_row_bytes,
             .nb03 = (uint64_t)n_tokens * n_head * q_row_bytes,
             .ne11 = (int32_t)cache_len,
-            .ne_12_2 = (int32_t)n_head,
+            .ne_12_2 = (int32_t)n_head_kv,
             .ne_12_3 = 1,
             .ns10 = (int32_t)qk_dim,
             .nb11 = q_row_bytes_f16,
             .nb12 = (uint64_t)cache_len * q_row_bytes_f16,
-            .nb13 = (uint64_t)cache_len * (uint64_t)n_head * q_row_bytes_f16,
+            .nb13 = (uint64_t)cache_len * (uint64_t)n_head_kv * q_row_bytes_f16,
             .ns20 = (int32_t)value_dim,
             .nb21 = v_row_bytes_f16,
             .nb22 = (uint64_t)cache_len * v_row_bytes_f16,
-            .nb23 = (uint64_t)cache_len * (uint64_t)n_head * v_row_bytes_f16,
+            .nb23 = (uint64_t)cache_len * (uint64_t)n_head_kv * v_row_bytes_f16,
             .ne31 = (int32_t)n_tokens,
             .ne32 = 1,
             .ne33 = 1,
@@ -33658,6 +33661,7 @@ int ds4_gpu_glm_attention_flash_tensor(
                                                    cache_len,
                                                    cache_cap,
                                                    n_head,
+                                                   n_head,
                                                    qk_dim,
                                                    value_dim,
                                                    cache_f16,
@@ -33687,10 +33691,261 @@ int ds4_gpu_glm_attention_flash_staged_tensor(
                                                    cache_len,
                                                    cache_cap,
                                                    n_head,
+                                                   n_head,
                                                    qk_dim,
                                                    value_dim,
                                                    cache_f16,
                                                    1);
+}
+
+int ds4_gpu_qwen35_attention_flash_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *key_cache,
+        const ds4_gpu_tensor *value_cache,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_len,
+        uint32_t              cache_cap,
+        uint32_t              n_head,
+        uint32_t              n_head_kv,
+        uint32_t              qk_dim,
+        uint32_t              value_dim,
+        bool                  cache_f16) {
+    return ds4_gpu_glm_attention_flash_tensor_impl(heads,
+                                                   q,
+                                                   key_cache,
+                                                   value_cache,
+                                                   pos0,
+                                                   n_tokens,
+                                                   cache_len,
+                                                   cache_cap,
+                                                   n_head,
+                                                   n_head_kv,
+                                                   qk_dim,
+                                                   value_dim,
+                                                   cache_f16,
+                                                   0);
+}
+
+/* Weighted per-head RMSNorm over a strided row layout.  `rows` heads each
+ * start `stride` bytes apart and only the first `n` floats are normalised and
+ * weighted, so the same kernel serves the interleaved query+gate projection
+ * (stride 2*head_dim) and the contiguous K projection (stride head_dim). */
+int ds4_gpu_qwen35_head_rms_norm_tensor(
+        ds4_gpu_tensor *x,
+        const void     *model_map,
+        uint64_t        model_size,
+        uint64_t        weight_offset,
+        uint32_t        rows,
+        uint32_t        n,
+        uint64_t        stride,
+        float           eps) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!x || !model_map || rows == 0 || n == 0 || (n & 3u) != 0 ||
+        stride < (uint64_t)n * sizeof(float)) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        const uint64_t bytes =
+            (uint64_t)(rows - 1u) * stride + (uint64_t)n * sizeof(float);
+        if (!xbuf || ds4_gpu_tensor_bytes(x) < bytes) {
+            fprintf(stderr,
+                    "ds4: Metal qwen35 head RMS norm received undersized buffer\n");
+            return 0;
+        }
+        const uint64_t weight_bytes = (uint64_t)n * sizeof(float);
+        if (weight_offset > model_size ||
+            weight_bytes > model_size - weight_offset) {
+            fprintf(stderr,
+                    "ds4: Metal qwen35 head RMS norm weight is outside the mapped model\n");
+            return 0;
+        }
+
+        uint64_t inner_offset = 0;
+        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map,
+                                                       model_size,
+                                                       weight_offset,
+                                                       weight_bytes,
+                                                       &inner_offset);
+        if (!wbuf) return 0;
+
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_qwen35_head_rms_norm_f32_4");
+        if (!pipeline) return 0;
+
+        struct {
+            int32_t  n;
+            int32_t  n4;
+            uint64_t stride;
+            float    eps;
+        } args = {
+            .n = (int32_t)n,
+            .n4 = (int32_t)(n / 4u),
+            .stride = stride,
+            .eps = eps,
+        };
+
+        const NSUInteger n4 = (NSUInteger)(n / 4u);
+        NSUInteger max_threads = pipeline.maxTotalThreadsPerThreadgroup;
+        if (max_threads > 256u) max_threads = 256u;
+        NSUInteger nth = 32u;
+        while (nth < n4 && nth < max_threads) nth *= 2u;
+        if (nth > n4) nth = n4;
+        if (nth < 32u) nth = 32u;
+        if (nth > max_threads) nth = max_threads;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "qwen35 head RMS norm")) return 0;
+    }
+
+    return 1;
+}
+
+/* In-place partial Neox half-pair RoPE over the first n_rot dims of each
+ * head, matching the CPU qwen35_rope_neox_front (pair p with p+n_rot/2). */
+int ds4_gpu_qwen35_rope_neox_front_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t        n_tokens,
+        uint32_t        n_head,
+        uint32_t        head_dim,
+        uint32_t        n_rot,
+        uint64_t        head_stride,
+        uint64_t        row_stride,
+        uint32_t        pos0,
+        float           freq_base) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!x || n_tokens == 0 || n_head == 0 || head_dim == 0 ||
+        n_rot == 0 || (n_rot & 1u) != 0u || n_rot > head_dim ||
+        head_stride < (uint64_t)n_rot * sizeof(float) ||
+        row_stride < (uint64_t)n_head * head_stride ||
+        !isfinite(freq_base) || freq_base <= 0.0f) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        const uint64_t bytes =
+            (uint64_t)(n_tokens - 1u) * row_stride +
+            (uint64_t)(n_head - 1u) * head_stride +
+            (uint64_t)head_dim * sizeof(float);
+        if (!xbuf || ds4_gpu_tensor_bytes(x) < bytes) {
+            fprintf(stderr,
+                    "ds4: Metal qwen35 RoPE received undersized buffer\n");
+            return 0;
+        }
+
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_qwen35_rope_neox_front_f32");
+        if (!pipeline) return 0;
+
+        struct {
+            int32_t  n_head;
+            int32_t  head_dim;
+            int32_t  n_rot;
+            int32_t  n_half;
+            uint64_t head_stride;
+            uint64_t row_stride;
+            int32_t  pos0;
+            int32_t  pos_step;
+            float    freq_base;
+        } args = {
+            .n_head = (int32_t)n_head,
+            .head_dim = (int32_t)head_dim,
+            .n_rot = (int32_t)n_rot,
+            .n_half = (int32_t)(n_rot / 2u),
+            .head_stride = head_stride,
+            .row_stride = row_stride,
+            .pos0 = (int32_t)pos0,
+            .pos_step = 1,
+            .freq_base = freq_base,
+        };
+
+        NSUInteger nth = (NSUInteger)(n_rot / 2u);
+        NSUInteger max_threads = pipeline.maxTotalThreadsPerThreadgroup;
+        if (max_threads > 256u) max_threads = 256u;
+        if (nth > max_threads) nth = max_threads;
+        if (nth == 0) nth = 1u;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head,
+                                              (NSUInteger)n_tokens,
+                                              1)
+             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "qwen35 RoPE")) return 0;
+    }
+
+    return 1;
+}
+
+/* Elementwise sigmoid(x) using unary.metal's OP_UNARY_NUM_SIGMOID. */
+int ds4_gpu_sigmoid_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        uint32_t              n) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !x || n == 0) return 0;
+    if (n > (uint32_t)INT32_MAX) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> obuf = ds4_gpu_tensor_buffer(out);
+        const uint64_t bytes = (uint64_t)n * sizeof(float);
+        if (!xbuf || !obuf ||
+            ds4_gpu_tensor_bytes(x) < bytes ||
+            ds4_gpu_tensor_bytes(out) < bytes) {
+            fprintf(stderr,
+                    "ds4: Metal sigmoid received undersized buffers\n");
+            return 0;
+        }
+        if (!g_unary_sigmoid_pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        if (!ds4_gpu_encode_unary_f32_rows(cb,
+                                           g_unary_sigmoid_pipeline,
+                                           xbuf,
+                                           ds4_gpu_tensor_offset(x),
+                                           obuf,
+                                           ds4_gpu_tensor_offset(out),
+                                           n,
+                                           1u,
+                                           0,
+                                           0.0f,
+                                           0.0f)) {
+            return 0;
+        }
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "qwen35 sigmoid")) return 0;
+    }
+
+    return 1;
 }
 
 int ds4_gpu_glm_attention_full_tensor(

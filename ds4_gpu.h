@@ -3083,6 +3083,57 @@ int ds4_gpu_qwen35_gdn_decode(
         uint32_t              n_rows,
         float                 norm_eps);
 
+/* Qwen3.5-MoE full-attention support (Metal).  GQA FlashAttention keeps
+ * `n_head_kv` K/V heads against `n_head` query heads; `heads`, `q` and the
+ * caches are FP32 (or F16 cache) with the Graph-layout
+ * [token][head][dim] / [cap][n_head_kv][dim]. */
+int ds4_gpu_qwen35_attention_flash_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *key_cache,
+        const ds4_gpu_tensor *value_cache,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_len,
+        uint32_t              cache_cap,
+        uint32_t              n_head,
+        uint32_t              n_head_kv,
+        uint32_t              qk_dim,
+        uint32_t              value_dim,
+        bool                  cache_f16);
+
+/* Weighted per-head RMSNorm over `rows` head rows `stride` bytes apart; only
+ * the first `n` floats of each row are normalised, which lets the same kernel
+ * serve the interleaved query+gate projection (stride 2*head_dim) and K. */
+int ds4_gpu_qwen35_head_rms_norm_tensor(
+        ds4_gpu_tensor *x,
+        const void     *model_map,
+        uint64_t        model_size,
+        uint64_t        weight_offset,
+        uint32_t        rows,
+        uint32_t        n,
+        uint64_t        stride,
+        float           eps);
+
+/* In-place partial Neox half-pair RoPE over the first n_rot dims of each
+ * head (pair p with p + n_rot/2), matching qwen35_rope_neox_front. */
+int ds4_gpu_qwen35_rope_neox_front_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t        n_tokens,
+        uint32_t        n_head,
+        uint32_t        head_dim,
+        uint32_t        n_rot,
+        uint64_t        head_stride,
+        uint64_t        row_stride,
+        uint32_t        pos0,
+        float           freq_base);
+
+/* Elementwise sigmoid(x). */
+int ds4_gpu_sigmoid_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        uint32_t              n);
+
 /* Decode-island CUDA graph capture (CUDA backend; Metal/ROCm/CPU stub it
  * out and stay eager).  Design ported from the Entrpi/ds4 batched-serving
  * fork's per-layer decode graph capture.  The key identifies a captured
