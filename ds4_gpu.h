@@ -3057,6 +3057,30 @@ int ds4_gpu_glm53_kda_prefill(
         float                 gate_lower_bound,
         float                 norm_eps);
 
+/* Qwen3.5-MoE / Ornith 1.5 35B gated-delta-net decode.  qkv, z, alpha and beta
+ * are the already-projected rows (attn_qkv, attn_gate, ssm_alpha, ssm_beta);
+ * the kernel does the fused conv, the q/k L2 norm and 2:1 value-head
+ * broadcast, the exp-softplus decay, the delta-rule recurrence, the
+ * RMSNormGated * silu(z) gate and the ssm_out projection.  conv_state and
+ * recurrent_state are the persistent per-layer FP32 buffers. */
+int ds4_gpu_qwen35_gdn_decode(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        const ds4_gpu_tensor *qkv,
+        const ds4_gpu_tensor *z,
+        const ds4_gpu_tensor *alpha,
+        const ds4_gpu_tensor *beta,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              conv1d_offset,
+        uint64_t              a_log_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              norm_offset,
+        uint64_t              ssm_out_offset,
+        uint32_t              n_rows,
+        float                 norm_eps);
+
 /* Decode-island CUDA graph capture (CUDA backend; Metal/ROCm/CPU stub it
  * out and stay eager).  Design ported from the Entrpi/ds4 batched-serving
  * fork's per-layer decode graph capture.  The key identifies a captured
