@@ -74759,9 +74759,16 @@ static int qwen35_forward_prefill(
     return 0;
 }
 
-int ds4_test_qwen35_forward_logits(const char *gguf, const uint32_t *tokens,
-                                   uint32_t n_tokens, uint32_t n_steps,
-                                   float *logits_out, uint32_t *greedy_out) {
+/* `forced` (optional) supplies the token appended after each step instead of
+ * the greedy token.  The full O0 comparison forces the reference's own
+ * continuation so every step is scored against the prefix the reference used;
+ * otherwise one near-tie at step k makes every later step an off-prefix
+ * comparison.  The first divergent step is the same in either mode (prefixes
+ * agree up to the first divergence). */
+static int qwen35_forward_logits_impl(const char *gguf, const uint32_t *tokens,
+                                      uint32_t n_tokens, uint32_t n_steps,
+                                      const uint32_t *forced,
+                                      float *logits_out, uint32_t *greedy_out) {
     if (!gguf || !tokens || n_tokens == 0 || n_steps == 0 ||
         !logits_out || !greedy_out) {
         return 1;
@@ -74797,7 +74804,7 @@ int ds4_test_qwen35_forward_logits(const char *gguf, const uint32_t *tokens,
         if (rc != 0) break;
         if (s + 1u < n_steps) {
             if (len >= cap) { rc = 1; break; }
-            seq[len++] = greedy_out[s];
+            seq[len++] = forced ? forced[s] : greedy_out[s];
         }
     }
 
@@ -74808,6 +74815,26 @@ int ds4_test_qwen35_forward_logits(const char *gguf, const uint32_t *tokens,
     free(seq);
     model_close(&m);
     return rc;
+}
+
+int ds4_test_qwen35_forward_logits(const char *gguf, const uint32_t *tokens,
+                                   uint32_t n_tokens, uint32_t n_steps,
+                                   float *logits_out, uint32_t *greedy_out) {
+    return qwen35_forward_logits_impl(gguf, tokens, n_tokens, n_steps, NULL,
+                                      logits_out, greedy_out);
+}
+
+/* Same forward, but appends `continuation[s]` after step s rather than the
+ * greedy token.  `continuation` is the reference's per-step selected token, so
+ * each returned row is the engine's prediction for the exact reference prefix. */
+int ds4_test_qwen35_forward_logits_ref(const char *gguf, const uint32_t *tokens,
+                                       uint32_t n_tokens,
+                                       const uint32_t *continuation,
+                                       uint32_t n_steps,
+                                       float *logits_out, uint32_t *greedy_out) {
+    if (!continuation) return 1;
+    return qwen35_forward_logits_impl(gguf, tokens, n_tokens, n_steps,
+                                      continuation, logits_out, greedy_out);
 }
 #endif
 
