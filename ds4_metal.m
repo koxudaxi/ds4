@@ -36881,8 +36881,8 @@ int ds4_gpu_glm_routed_moe_one_tensor(
              gate_pair_q5 ?
              ds4_gpu_hot_pipeline(g_glm_q5_k_pair_swiglu_f32_pipeline,
                                   "kernel_glm_q5_K_pair_swiglu_f32") :
-             ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu2_f32_pipeline,
-                                  "kernel_glm_q4_K_pair_swiglu2_f32"));
+             ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu4_f32_pipeline,
+                                  "kernel_glm_q4_K_pair_swiglu4_f32"));
         id<MTLComputePipelineState> down_pipeline =
             (use_stream_expert_addr_table ?
              (down_scalar_q2 ?
@@ -36920,7 +36920,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
             (gate_pair_q2 ? "q2_stream_addr_swiglu" :
                             "q4_stream_addr_swiglu") :
             gate_pair_q2 ? "q2_scalar_swiglu" :
-            gate_pair_q5 ? "q5_pair_simd_swiglu" : "q4_pair2_simd_swiglu";
+            gate_pair_q5 ? "q5_pair_simd_swiglu" : "q4_pair4_simd_swiglu";
         const char *glm_down_path =
             use_stream_expert_addr_table ?
             (down_scalar_q2 ? "q2_stream_addr_down" :
@@ -36995,7 +36995,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                             (NSUInteger)((expert_mid_dim + 7u) / 8u)) :
             gate_pair_q5 ? (NSUInteger)((expert_mid_dim + 7u) / 8u) :
             use_stream_expert_addr_table ? (NSUInteger)((expert_mid_dim + 3u) / 4u) :
-            (NSUInteger)((expert_mid_dim + 1u) / 2u);
+            (NSUInteger)((expert_mid_dim + 7u) / 8u);
         const NSUInteger pair_threadgroup_bytes = 0u;
         const NSUInteger pair_threads = 64u;
         const NSUInteger down_x_groups =
