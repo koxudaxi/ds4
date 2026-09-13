@@ -3134,6 +3134,54 @@ int ds4_gpu_sigmoid_tensor(
         const ds4_gpu_tensor *x,
         uint32_t              n);
 
+/* Elementwise out = a * b over n F32 values.  Backed by the existing binary
+ * multiply kernel; used by the qwen35 sigmoid output gate. */
+int ds4_gpu_mul_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *a,
+        const ds4_gpu_tensor *b,
+        uint32_t              n);
+
+/* out = x * scalar[0] over n F32 values, with the scalar read on the GPU so no
+ * host round-trip is needed.  Used by the qwen35 gated shared expert. */
+int ds4_gpu_mul_scalar_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *scalar,
+        uint32_t              n);
+
+/* Qwen3.5-MoE softmax-over-all router: max-subtracted softmax, top-k by
+ * probability, renormalised weights, matching qwen35_moe_route.  One
+ * threadgroup per token. */
+int ds4_gpu_qwen35_moe_route_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        const ds4_gpu_tensor *logits,
+        uint32_t              n_expert,
+        uint32_t              n_expert_used,
+        float                 expert_weight_scale,
+        uint32_t              n_tokens);
+
+/* Gated-delta-net decode producing the pre-`ssm_out` normalised attn rows
+ * [n_rows][d_inner]; the caller then runs `ssm_out` through the dense quant
+ * matmul (the artifact stores ssm_out quantised). */
+int ds4_gpu_qwen35_gdn_decode_pre_out(
+        ds4_gpu_tensor       *attn,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        const ds4_gpu_tensor *qkv,
+        const ds4_gpu_tensor *z,
+        const ds4_gpu_tensor *alpha,
+        const ds4_gpu_tensor *beta,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              conv1d_offset,
+        uint64_t              a_log_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              norm_offset,
+        uint32_t              n_rows,
+        float                 norm_eps);
+
 /* Decode-island CUDA graph capture (CUDA backend; Metal/ROCm/CPU stub it
  * out and stay eager).  Design ported from the Entrpi/ds4 batched-serving
  * fork's per-layer decode graph capture.  The key identifies a captured

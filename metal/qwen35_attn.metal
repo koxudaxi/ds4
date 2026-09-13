@@ -113,3 +113,66 @@ kernel void kernel_qwen35_rope_neox_front_f32(
     head[j0] = x0 * c - x1 * s;
     head[j1] = x0 * s + x1 * c;
 }
+
+// Qwen3.5-MoE router.  Matches ds4.c's qwen35_moe_route exactly: a max-
+// subtracted softmax over ALL experts, top-k selection by probability (ties
+// keep the lower expert index), then renormalisation of the selected k
+// weights.  One threadgroup per token; the whole selection runs on lane 0
+// after the softmax numerator is staged in shared memory.  This is a distinct
+// convention from the DeepSeek (sigmoid) and GLM (softplus) routers.
+struct qwen35_route_args {
+    int32_t n_expert;
+    int32_t n_expert_used;
+    float   expert_weight_scale;
+    int32_t pad0;
+};
+
+kernel void kernel_qwen35_moe_route(
+        constant qwen35_route_args & args,
+        device const float * logits,
+        device int32_t     * selected,
+        device float       * weights,
+        threadgroup float  * shmem [[threadgroup(0)]],
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort3 tpitg [[thread_position_in_threadgroup]]) {
+    const uint row = tgpig.x;
+    const uint tid = tpitg.x;
+    const int  n   = args.n_expert;
+    const int  k   = args.n_expert_used;
+
+    device const float *row_logits   = logits   + (uint64_t)row * n;
+    device int32_t     *row_selected = selected + (uint64_t)row * k;
+    device float       *row_weights  = weights  + (uint64_t)row * k;
+
+    if ((int)tid < n) {
+        float m = row_logits[0];
+        for (int i = 1; i < n; i++) {
+            m = max(m, row_logits[i]);
+        }
+        shmem[tid] = exp(row_logits[tid] - m);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0 && k <= 32) {
+        int sel[32];
+        for (int t = 0; t < k; t++) {
+            int best = -1;
+            for (int i = 0; i < n; i++) {
+                bool taken = false;
+                for (int j = 0; j < t; j++) {
+                    if (sel[j] == i) { taken = true; break; }
+                }
+                if (taken) continue;
+                if (best < 0 || shmem[i] > shmem[best]) best = i;
+            }
+            sel[t] = best;
+        }
+        float wsum = 0.0f;
+        for (int t = 0; t < k; t++) wsum += shmem[sel[t]];
+        if (!(wsum > 0.0f)) wsum = 1.0f;
+        for (int t = 0; t < k; t++) {
+            row_selected[t] = sel[t];
+            row_weights[t] = shmem[sel[t]] / wsum * args.expert_weight_scale;
+        }
+    }
+}
