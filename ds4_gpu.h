@@ -3162,6 +3162,25 @@ int ds4_gpu_qwen35_moe_route_tensor(
         float                 expert_weight_scale,
         uint32_t              n_tokens);
 
+/* Batched chunked-prefill helpers.  `split_q_gate` turns the interleaved
+ * per-head query+gate projection into a contiguous FlashAttention query and a
+ * contiguous gate, both [n_tokens][n_head][head_dim].  `row_scale` is
+ * out[row][i] = x[row][i] * scale[row]. */
+int ds4_gpu_qwen35_split_q_gate_tensor(
+        ds4_gpu_tensor       *q_out,
+        ds4_gpu_tensor       *gate_out,
+        const ds4_gpu_tensor *q_gate,
+        uint32_t              n_tokens,
+        uint32_t              n_head,
+        uint32_t              head_dim);
+
+int ds4_gpu_qwen35_row_scale_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *scale,
+        uint32_t              width,
+        uint32_t              rows);
+
 /* Gated-delta-net decode producing the pre-`ssm_out` normalised attn rows
  * [n_rows][d_inner]; the caller then runs `ssm_out` through the dense quant
  * matmul (the artifact stores ssm_out quantised). */

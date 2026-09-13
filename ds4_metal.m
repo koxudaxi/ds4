@@ -34155,6 +34155,142 @@ int ds4_gpu_qwen35_moe_route_tensor(
     return 1;
 }
 
+/* Split the interleaved per-head [q(head_dim), gate(head_dim)] query+gate
+ * projection into a contiguous FlashAttention query and a contiguous gate,
+ * both [n_tokens][n_head][head_dim].  Batched chunked-prefill support. */
+int ds4_gpu_qwen35_split_q_gate_tensor(
+        ds4_gpu_tensor       *q_out,
+        ds4_gpu_tensor       *gate_out,
+        const ds4_gpu_tensor *q_gate,
+        uint32_t              n_tokens,
+        uint32_t              n_head,
+        uint32_t              head_dim) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!q_out || !gate_out || !q_gate || n_tokens == 0 || n_head == 0 ||
+        head_dim == 0 || head_dim > 1024u) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> srcbuf = ds4_gpu_tensor_buffer(q_gate);
+        id<MTLBuffer> qbuf = ds4_gpu_tensor_buffer(q_out);
+        id<MTLBuffer> gbuf = ds4_gpu_tensor_buffer(gate_out);
+        const uint64_t rows = (uint64_t)n_tokens * n_head;
+        const uint64_t row_bytes = (uint64_t)head_dim * sizeof(float);
+        const uint64_t out_bytes = rows * row_bytes;
+        const uint64_t src_bytes = rows * 2u * row_bytes;
+        if (!srcbuf || !qbuf || !gbuf ||
+            ds4_gpu_tensor_bytes(q_gate) < src_bytes ||
+            ds4_gpu_tensor_bytes(q_out) < out_bytes ||
+            ds4_gpu_tensor_bytes(gate_out) < out_bytes) {
+            fprintf(stderr,
+                    "ds4: Metal qwen35 q/gate split received undersized buffers\n");
+            return 0;
+        }
+
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_qwen35_split_q_gate");
+        if (!pipeline) return 0;
+
+        struct {
+            int32_t n_tokens;
+            int32_t n_head;
+            int32_t head_dim;
+        } args = {
+            .n_tokens = (int32_t)n_tokens,
+            .n_head = (int32_t)n_head,
+            .head_dim = (int32_t)head_dim,
+        };
+
+        NSUInteger nth = (NSUInteger)head_dim;
+        NSUInteger max_threads = pipeline.maxTotalThreadsPerThreadgroup;
+        if (nth > max_threads) nth = max_threads;
+        if (nth == 0) nth = 1u;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:srcbuf offset:ds4_gpu_tensor_offset(q_gate) atIndex:1];
+        [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q_out) atIndex:2];
+        [enc setBuffer:gbuf offset:ds4_gpu_tensor_offset(gate_out) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head,
+                                              (NSUInteger)n_tokens,
+                                              1)
+             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "qwen35 q/gate split")) return 0;
+    }
+
+    return 1;
+}
+
+/* out[row][i] = x[row][i] * scale[row] for `rows` rows of `width` F32 values.
+ * Batched gated shared expert support. */
+int ds4_gpu_qwen35_row_scale_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *scale,
+        uint32_t              width,
+        uint32_t              rows) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !x || !scale || width == 0 || rows == 0) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> sbuf = ds4_gpu_tensor_buffer(scale);
+        id<MTLBuffer> obuf = ds4_gpu_tensor_buffer(out);
+        const uint64_t elems = (uint64_t)width * rows;
+        if (elems > UINT64_MAX / sizeof(float)) return 0;
+        const uint64_t bytes = elems * sizeof(float);
+        const uint64_t scale_bytes = (uint64_t)rows * sizeof(float);
+        if (!xbuf || !sbuf || !obuf ||
+            ds4_gpu_tensor_bytes(x) < bytes ||
+            ds4_gpu_tensor_bytes(out) < bytes ||
+            ds4_gpu_tensor_bytes(scale) < scale_bytes) {
+            fprintf(stderr,
+                    "ds4: Metal qwen35 row scale received undersized buffers\n");
+            return 0;
+        }
+
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_qwen35_row_scale_f32");
+        if (!pipeline) return 0;
+
+        struct {
+            int32_t width;
+        } args = { .width = (int32_t)width };
+
+        NSUInteger nth = 256u;
+        NSUInteger max_threads = pipeline.maxTotalThreadsPerThreadgroup;
+        if (nth > max_threads) nth = max_threads;
+        if (nth > (NSUInteger)width) nth = (NSUInteger)width;
+        if (nth == 0u) nth = 1u;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
+        [enc setBuffer:sbuf offset:ds4_gpu_tensor_offset(scale) atIndex:2];
+        [enc setBuffer:obuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "qwen35 row scale")) return 0;
+    }
+
+    return 1;
+}
+
 int ds4_gpu_glm_attention_full_tensor(
         ds4_gpu_tensor       *heads,
         const ds4_gpu_tensor *q,

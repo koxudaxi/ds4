@@ -222,3 +222,55 @@ kernel void kernel_qwen35_moe_route(
         }
     }
 }
+
+// Batched chunked-prefill support.
+//
+// The joint query+gate projection is [token][head][2*head_dim] with the query
+// in the first half and the sigmoid gate in the second.  FlashAttention needs
+// a contiguous [token][head][head_dim] query, so split the two halves into
+// separate buffers.  One threadgroup per (head, token), one thread per dim.
+struct qwen35_split_q_gate_args {
+    int32_t n_tokens;
+    int32_t n_head;
+    int32_t head_dim;
+};
+
+kernel void kernel_qwen35_split_q_gate(
+        constant qwen35_split_q_gate_args & args,
+        device const float * q_gate,
+        device       float * q_out,
+        device       float * gate_out,
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort3 tpitg [[thread_position_in_threadgroup]]) {
+    const int t = (int)tgpig[1];
+    const int h = (int)tgpig[0];
+    const int d = (int)tpitg[0];
+    if (t >= args.n_tokens || h >= args.n_head || d >= args.head_dim) return;
+    const ulong src = ((ulong)t * args.n_head + h) * (2ul * args.head_dim) +
+                      (ulong)d;
+    const ulong dst = ((ulong)t * args.n_head + h) * args.head_dim + (ulong)d;
+    q_out[dst] = q_gate[src];
+    gate_out[dst] = q_gate[src + args.head_dim];
+}
+
+// Per-row scalar broadcast: out[row][i] = x[row][i] * scale[row].  The gated
+// shared expert computes one sigmoid scalar per token; the existing
+// mul_scalar kernel only broadcasts scale[0], so a batched chunk needs this.
+struct qwen35_row_scale_args {
+    int32_t width;
+};
+
+kernel void kernel_qwen35_row_scale_f32(
+        constant qwen35_row_scale_args & args,
+        device const float * x,
+        device const float * scale,
+        device       float * out,
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort3 tpitg [[thread_position_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const ulong base = (ulong)tgpig[0] * (ulong)args.width;
+    const float s = scale[tgpig[0]];
+    for (int i = tpitg[0]; i < args.width; i += ntg[0]) {
+        out[base + (ulong)i] = x[base + (ulong)i] * s;
+    }
+}
