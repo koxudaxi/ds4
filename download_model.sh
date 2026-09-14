@@ -3,29 +3,28 @@ set -e
 
 GLM_UNSLOTH_REPO="unsloth/GLM-5.2-GGUF"
 GLM_ANTIREZ_REPO="antirez/GLM-5.2-GGUF"
-LAGUNA_REPO="poolside/Laguna-S-2.1-GGUF"
-LAGUNA_ANTIREZ_REPO="antirez/Laguna-S-2.1-GGUF"
-LAGUNA_REVISION="706fa69799926b6afde1af9e24ca2a4923f110a1"
-LAGUNA_XS21_REPO="poolside/Laguna-XS-2.1-GGUF"
-LAGUNA_XS21_REVISION="1a37c0a5fb8c7a18e6106decb6be6327d1b63fa6"
+GLM53_REPO="antirez/glm-5.3-flash-gguf"
+GLM53_FULL_REPO="antirez/glm-5.3-gguf"
 REPO="antirez/deepseek-v4-gguf"
-Q2_IMATRIX_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
-Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
-Q2_Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed.gguf"
-PRO_Q2_IMATRIX_FILE="DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf"
+DS4F_Q2_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
+DS4F_Q4_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf"
+DS4F_MXFP4_FILE="DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf"
+DS4F_Q2_Q4_FILE="DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf"
+PRO_Q2_IMATRIX_FILE="DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix-0813.gguf"
 PRO_Q4_LAYERS00_30_FILE="DeepSeek-V4-Pro-Q4K-Layers00-30.gguf"
 PRO_Q4_LAYERS31_OUTPUT_FILE="DeepSeek-V4-Pro-Q4K-Layers-31-output.gguf"
-MTP_FILE="DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"
-DSPARK_SUPPORT_FILE="DeepSeek-V4-Flash-DSpark-support.gguf"
+DS4F_DSPARK_FILE="DeepSeek-V4-Flash-DSpark-support-0731.gguf"
 GLM_UNSLOTH_Q4_REMOTE_BASE="UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL"
 GLM_UNSLOTH_Q4_LOCAL_BASE="GLM-5.2-UD-Q4_K_XL"
 GLM_UNSLOTH_Q4_FIRST_FILE="$GLM_UNSLOTH_Q4_LOCAL_BASE-00001-of-00011.gguf"
 GLM_ANTIREZ_IQ2XXS_FILE="GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf"
 GLM_ANTIREZ_Q2_FILE="GLM-5.2-UD-Q2_K_RoutedQ2K.gguf"
 GLM_ANTIREZ_Q4_FILE="GLM-5.2-UD-Q4_K_RoutedQ4K.gguf"
-LAGUNA_Q4_FILE="laguna-s-2.1-Q4_K_M.gguf"
-LAGUNA_Q2_Q3_FILE="laguna-s-2.1-RoutedQ2_K-Last27Q3_K.gguf"
-LAGUNA_XS21_Q4_FILE="Laguna-XS-2.1-Q4_K_M.gguf"
+GLM53_FULL_Q2_FILE="GLM-5.3-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf"
+GLM53_Q2_FILE="GLM-5.3-Flash-Q2.gguf"
+GLM53_Q4_FILE="GLM-5.3-Flash-Q4_K.gguf"
+GLM53_FP8_FILE="GLM-5.3-Flash-FP8.gguf"
+GLM53_VISION_FILE="GLM-5.3-Flash-Vision-Encoder.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -34,49 +33,59 @@ case "$OUT_DIR" in
     *) OUT_DIR="$ROOT/$OUT_DIR" ;;
 esac
 TOKEN=${HF_TOKEN:-}
-HF_REVISION=
 
 usage() {
     cat <<EOF
 DwarfStar GGUF downloader
 
 Usage:
-  ./download_model.sh q2-imatrix [--token TOKEN]
-  ./download_model.sh q2-q4-imatrix [--token TOKEN]
-  ./download_model.sh q4-imatrix [--token TOKEN]
+  ./download_model.sh ds4f-q2 [--token TOKEN]
+  ./download_model.sh ds4f-q2-q4 [--token TOKEN]
+  ./download_model.sh ds4f-q4 [--token TOKEN]
+  ./download_model.sh ds4f-mxfp4 [--token TOKEN]
+  ./download_model.sh ds4f-dspark [--token TOKEN]
   ./download_model.sh pro-q2-imatrix [--token TOKEN]
   ./download_model.sh pro-q4-layers00-30 [--token TOKEN]
   ./download_model.sh pro-q4-layers31-output [--token TOKEN]
   ./download_model.sh pro-q4-split [--token TOKEN]
-  ./download_model.sh mtp [--token TOKEN]
-  ./download_model.sh dspark-support [--token TOKEN]
   ./download_model.sh glm-unsloth-q4 [--token TOKEN]
   ./download_model.sh glm-antirez-iq2xxs [--token TOKEN]
   ./download_model.sh glm-antirez-q2 [--token TOKEN]
   ./download_model.sh glm-antirez-q4 [--token TOKEN]
-  ./download_model.sh laguna-q4 [--token TOKEN]
-  ./download_model.sh laguna-q2-q3 [--token TOKEN]
-  ./download_model.sh xs21-q4 [--token TOKEN]
+  ./download_model.sh glm53-full-q2 [--token TOKEN]
+  ./download_model.sh glm53-q2 [--token TOKEN]
+  ./download_model.sh glm53-q4 [--token TOKEN]
+  ./download_model.sh glm53-fp8 [--token TOKEN]
+  ./download_model.sh glm53-vision [--token TOKEN]
 
 Targets:
 
-  q2-imatrix
+  ds4f-q2
        2-bit routed experts, about 81 GB on disk.
        Recommended model for 96 and 128 GB RAM machines.
 
-  q2-q4-imatrix
+  ds4f-q2-q4
        Mixed Flash quant: mostly q2 routed experts, with the last 6 layers
        using q4 routed experts. About 98 GB on disk. Good for higher
        quality inference for 128 GB MacBooks. Works on DGX Spark but loading
-       may struggle compared to q2-imatrix.
+       may struggle compared to ds4f-q2.
 
-  q4-imatrix
+  ds4f-q4
        4-bit routed experts, about 153 GB on disk.
        Recommended model for machines with 256 GB RAM or more.
 
+  ds4f-mxfp4
+       Native DeepSeek V4 Flash MXFP4 routed experts, about 156 GB on disk.
+       Supported by Metal and CUDA; Blackwell uses FP4 tensor cores for batched
+       expert work, while CUDA decode keeps Q8 activations.
+
+  ds4f-dspark
+       Optional DSpark speculative decoding support GGUF for Flash 0731, about
+       6 GB. Enable it with --dspark and --mtp-model when running ds4 or ds4-server.
+
   pro-q2-imatrix
-       DeepSeek V4 PRO q2 imatrix quant, as a single GGUF file. About 430 GB
-       on disk; intended for 512 GB RAM machines.
+       DeepSeek V4 PRO 0813 q2 imatrix quant, as a single GGUF file. About
+       430 GB on disk; intended for 512 GB RAM machines.
 
   pro-q4-layers00-30
        First half of the DeepSeek V4 PRO Q4 routed-expert quant, layers 0..30.
@@ -90,14 +99,6 @@ Targets:
   pro-q4-split
        Downloads both PRO Q4 split files into the download directory. About
        838 GB total. This target does not update ./ds4flash.gguf.
-
-  mtp  Optional speculative decoding component, about 3.5 GB on disk.
-       It is useful with q2-imatrix, q2-q4-imatrix, and q4-imatrix, but must be
-       enabled explicitly with --mtp when running ds4 or ds4-server.
-
-  dspark-support
-       Optional DSpark speculative decoding support GGUF, about 6 GB. Enable it
-       with --dspark and --mtp when running ds4 or ds4-server.
 
   glm-unsloth-q4
        GLM 5.2 Unsloth UD-Q4_K_XL quant from unsloth/GLM-5.2-GGUF.
@@ -115,22 +116,26 @@ Targets:
        GLM 5.2 antirez routed Q4_K GGUF from antirez/GLM-5.2-GGUF.
        About 434 GB on disk.
 
-  laguna-q4
-       Official imatrix-quantized Laguna S 2.1 Q4_K_M GGUF from Poolside.
-       About 68 GB on disk; currently supported by the Metal backend with
-       full model residency.
+  glm53-full-q2
+       Full GLM 5.3 routed IQ2_XXS/Q2_K GGUF, about 197 GiB on disk.
+       Intended for 256 GB machines or SSD streaming on smaller systems.
 
-  laguna-q2-q3
-       Mixed Laguna S 2.1 routed-expert quant for 64 GB systems. Routed
-       layers 1..20 use Q2_K and layers 21..47 use Q3_K; all other tensors
-       retain the official Q4_K_M layout. 44.95 GiB on disk.
+  glm53-q2
+       GLM 5.3 Flash imatrix Q2 GGUF, about 90 GiB on disk. Intended for
+       resident inference on 128 GB Macs.
 
-  xs21-q4
-       Official imatrix-quantized Laguna XS 2.1 Q4_K_M GGUF from Poolside.
-       18.88 GiB on disk. Supported by the Metal backend both with full
-       model residency and with --ssd-streaming, which streams routed
-       experts through the expert cache so the model runs on smaller
-       machines.
+  glm53-q4
+       GLM 5.3 Flash Q4_K GGUF, about 178 GiB on disk. Intended for two-Mac
+       tensor parallelism or single-Mac SSD streaming.
+
+  glm53-fp8
+       Text-only GLM 5.3 Flash native FP8 GGUF, about 305 GiB on disk. It
+       preserves the released weights without requantization. DwarfStar
+       inference support for this paired FP8-code/scale format is pending.
+
+  glm53-vision
+       GLM 5.3 Flash vision encoder, about 1.1 GB on disk. Load it separately
+       with --vision; this target does not update ./ds4flash.gguf.
 
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
@@ -147,13 +152,10 @@ Then the default commands work:
   ./ds4 -p "Hello"
   ./ds4-server --ctx 100000
 
-After downloading mtp, enable it explicitly, for example:
-  ./ds4 --mtp <download directory>/$MTP_FILE --mtp-draft 2
-
 After downloading DSpark support, enable it explicitly in greedy mode:
-  ./ds4 --dspark --mtp <download directory>/$DSPARK_SUPPORT_FILE --temp 0
+  ./ds4 --dspark --mtp-model <download directory>/$DS4F_DSPARK_FILE --temp 0
 
-Large PRO, GLM, and Laguna files use the official Hugging Face downloader
+PRO and GLM files are downloaded with the official Hugging Face downloader
 because they are too large, sharded, or nested for the curl path used by the
 smaller DeepSeek Flash GGUF files.
 EOF
@@ -172,9 +174,11 @@ FORCE_HF_DOWNLOAD=0
 FLATTEN_DOWNLOADS=0
 
 case "$MODEL" in
-    q2-imatrix) MODEL_FILE=$Q2_IMATRIX_FILE ;;
-    q2-q4-imatrix) MODEL_FILE=$Q2_Q4_IMATRIX_FILE ;;
-    q4-imatrix) MODEL_FILE=$Q4_IMATRIX_FILE ;;
+    ds4f-q2) MODEL_FILE=$DS4F_Q2_FILE ;;
+    ds4f-q2-q4) MODEL_FILE=$DS4F_Q2_Q4_FILE ;;
+    ds4f-q4) MODEL_FILE=$DS4F_Q4_FILE ;;
+    ds4f-mxfp4) MODEL_FILE=$DS4F_MXFP4_FILE; FORCE_HF_DOWNLOAD=1 ;;
+    ds4f-dspark) MODEL_FILE=$DS4F_DSPARK_FILE; LINK_MODEL=0 ;;
     pro-q2-imatrix) MODEL_FILE=$PRO_Q2_IMATRIX_FILE ;;
     pro-q4-layers00-30) MODEL_FILE=$PRO_Q4_LAYERS00_30_FILE; LINK_MODEL=0 ;;
     pro-q4-layers31-output) MODEL_FILE=$PRO_Q4_LAYERS31_OUTPUT_FILE; LINK_MODEL=0 ;;
@@ -182,8 +186,6 @@ case "$MODEL" in
         MODEL_FILES="$PRO_Q4_LAYERS00_30_FILE $PRO_Q4_LAYERS31_OUTPUT_FILE"
         LINK_MODEL=0
         ;;
-    mtp) MODEL_FILE=$MTP_FILE; LINK_MODEL=0 ;;
-    dspark-support) MODEL_FILE=$DSPARK_SUPPORT_FILE; LINK_MODEL=0 ;;
     glm-unsloth-q4)
         REPO=$GLM_UNSLOTH_REPO
         MODEL_FILE=$GLM_UNSLOTH_Q4_FIRST_FILE
@@ -209,22 +211,32 @@ case "$MODEL" in
         MODEL_FILE=$GLM_ANTIREZ_Q4_FILE
         FORCE_HF_DOWNLOAD=1
         ;;
-    laguna-q4)
-        REPO=$LAGUNA_REPO
-        MODEL_FILE=$LAGUNA_Q4_FILE
-        FORCE_HF_DOWNLOAD=1
-        HF_REVISION=$LAGUNA_REVISION
-        ;;
-    laguna-q2-q3)
-        REPO=$LAGUNA_ANTIREZ_REPO
-        MODEL_FILE=$LAGUNA_Q2_Q3_FILE
+    glm53-full-q2)
+        REPO=$GLM53_FULL_REPO
+        MODEL_FILE=$GLM53_FULL_Q2_FILE
         FORCE_HF_DOWNLOAD=1
         ;;
-    xs21-q4)
-        REPO=$LAGUNA_XS21_REPO
-        MODEL_FILE=$LAGUNA_XS21_Q4_FILE
+    glm53-q2)
+        REPO=$GLM53_REPO
+        MODEL_FILE=$GLM53_Q2_FILE
         FORCE_HF_DOWNLOAD=1
-        HF_REVISION=$LAGUNA_XS21_REVISION
+        ;;
+    glm53-q4)
+        REPO=$GLM53_REPO
+        MODEL_FILE=$GLM53_Q4_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    glm53-fp8)
+        REPO=$GLM53_REPO
+        MODEL_FILE=$GLM53_FP8_FILE
+        FORCE_HF_DOWNLOAD=1
+        LINK_MODEL=0
+        ;;
+    glm53-vision)
+        REPO=$GLM53_REPO
+        MODEL_FILE=$GLM53_VISION_FILE
+        FORCE_HF_DOWNLOAD=1
+        LINK_MODEL=0
         ;;
     -h|--help|help)
         usage
@@ -327,18 +339,11 @@ download_one_hf() {
 
     echo "Downloading $file"
     echo "from https://huggingface.co/$REPO"
-    if [ -n "$HF_REVISION" ]; then
-        echo "revision $HF_REVISION"
-    fi
     echo "using $HF_CMD download"
     echo "If the download stops, run the same command again to resume it."
 
-    if [ -n "$TOKEN" ] && [ -n "$HF_REVISION" ]; then
-        "$HF_CMD" download "$REPO" "$file" --revision "$HF_REVISION" --repo-type model --local-dir "$OUT_DIR" --token "$TOKEN"
-    elif [ -n "$TOKEN" ]; then
+    if [ -n "$TOKEN" ]; then
         "$HF_CMD" download "$REPO" "$file" --repo-type model --local-dir "$OUT_DIR" --token "$TOKEN"
-    elif [ -n "$HF_REVISION" ]; then
-        "$HF_CMD" download "$REPO" "$file" --revision "$HF_REVISION" --repo-type model --local-dir "$OUT_DIR"
     else
         "$HF_CMD" download "$REPO" "$file" --repo-type model --local-dir "$OUT_DIR"
     fi
@@ -401,15 +406,10 @@ else
     download_one "$MODEL_FILE"
 fi
 
-if [ "$MODEL" = "mtp" ]; then
-    echo
-    echo "MTP is an optional component for q2-imatrix, q2-q4-imatrix, and q4-imatrix."
-    echo "Enable it explicitly, for example:"
-    echo "  ./ds4 --mtp $OUT_DIR/$MTP_FILE --mtp-draft 2"
-elif [ "$MODEL" = "dspark-support" ]; then
+if [ "$MODEL" = "ds4f-dspark" ]; then
     echo
     echo "DSpark support downloaded. Enable it explicitly in greedy mode:"
-    echo "  ./ds4 --dspark -m ./ds4flash.gguf --mtp $OUT_DIR/$DSPARK_SUPPORT_FILE --temp 0"
+    echo "  ./ds4 --dspark -m ./ds4flash.gguf --mtp-model $OUT_DIR/$DS4F_DSPARK_FILE --temp 0"
 elif [ "$MODEL" = "pro-q4-layers00-30" ] || [ "$MODEL" = "pro-q4-layers31-output" ] || [ "$MODEL" = "pro-q4-split" ]; then
     echo
     echo "Downloaded PRO Q4 distributed split file(s). Use them with --layers,"

@@ -13,7 +13,8 @@
  *     tiers used.
  *  4. CPU-spill placement: 2 GPUs with tiny budgets so some layers
  *     spill. multi_tier == 1 and at least one DS4_LAYER_PACK_CPU entry.
- *  5. GLM compact-cache accounting: ordinary, indexed, and NextN layers. */
+ *  5. GLM compact-cache accounting: ordinary, indexed, and NextN layers.
+ *  6. GLM batched-session placement scales independent cache allocations. */
 
 #define DS4_TEST_HOOKS
 #include "../ds4.h"
@@ -79,6 +80,15 @@ uint32_t ds4_test_laguna_prefill_cap(uint32_t ctx_size,
                                      uint32_t prefill_chunk);
 uint64_t ds4_test_laguna_xs21_scratch_bytes(uint32_t prefill_cap);
 size_t ds4_test_glm_per_layer_kv_bytes(uint32_t layer, int ctx_size);
+size_t ds4_test_compute_glm_entry_bytes_sum_with_sessions(
+                                         const ds4_test_fake_tensor *tensors,
+                                         int n_tensors,
+                                         int placement_ctx_hint,
+                                         int placement_session_count_hint);
+uint64_t ds4_test_glm_memory_guard_default_budget(uint64_t host_bytes,
+                                                   uint64_t model_bytes,
+                                                   bool glm53);
+int ds4_test_glm_memory_guard_disabled(void);
 
 /* DS4_N_LAYER constant is private to ds4.c; for the test we use
  * the same value. (The packer header doesn't expose it.) */
@@ -503,6 +513,27 @@ static void test_glm_per_layer_cache_accounting(void) {
           "GLM NextN layer has no generation cache");
 }
 
+static void test_glm_session_count_accounting(void) {
+    fprintf(stderr, "RUN: test_glm_session_count_accounting\n");
+    ds4_test_fake_tensor tensors[256];
+    const int n = build_synthetic_model(tensors, 256);
+    if (n <= 0) return;
+
+    size_t weights = 0;
+    for (int i = 0; i < n; i++) weights += (size_t)tensors[i].bytes;
+
+    const size_t one = ds4_test_compute_glm_entry_bytes_sum_with_sessions(
+        tensors, n, 4096, 1);
+    const size_t unset = ds4_test_compute_glm_entry_bytes_sum_with_sessions(
+        tensors, n, 4096, 0);
+    const size_t four = ds4_test_compute_glm_entry_bytes_sum_with_sessions(
+        tensors, n, 4096, 4);
+    CHECK(one > weights, "single GLM session includes compact-cache bytes");
+    CHECK(unset == one, "unset GLM session hint preserves one-session accounting");
+    CHECK(four > weights && four - weights == 4u * (one - weights),
+          "four GLM sessions reserve four independent compact caches");
+}
+
 static char *save_env_value(const char *name) {
     const char *v = getenv(name);
     if (!v) return NULL;
@@ -519,6 +550,36 @@ static void restore_env_value(const char *name, char *saved) {
     } else {
         unsetenv(name);
     }
+}
+
+static void test_glm_memory_guard_budget(void) {
+    fprintf(stderr, "RUN: test_glm_memory_guard_budget\n");
+    const uint64_t gib = 1024ull * 1024ull * 1024ull;
+
+    CHECK(ds4_test_glm_memory_guard_default_budget(
+                  128ull * gib, 90ull * gib, true) == 110ull * gib,
+          "GLM-5.3 keeps 18 GiB free on a 128 GiB resident-Q2 host");
+    CHECK(ds4_test_glm_memory_guard_default_budget(
+                  256ull * gib, 178ull * gib, true) == 224ull * gib,
+          "GLM-5.3 uses the host-sized budget on a 256 GiB host");
+    CHECK(ds4_test_glm_memory_guard_default_budget(
+                  256ull * gib, 178ull * gib, false) == 224ull * gib,
+          "larger-host budget is model-variant independent");
+
+    char *old_guard = save_env_value("DS4_GLM_MEMORY_GUARD");
+    unsetenv("DS4_GLM_MEMORY_GUARD");
+    CHECK(ds4_test_glm_memory_guard_disabled() == 0,
+          "memory guard defaults to enabled");
+    setenv("DS4_GLM_MEMORY_GUARD", "0", 1);
+    CHECK(ds4_test_glm_memory_guard_disabled() == 1,
+          "DS4_GLM_MEMORY_GUARD=0 disables the guard for every GLM variant");
+    setenv("DS4_GLM_MEMORY_GUARD", "false", 1);
+    CHECK(ds4_test_glm_memory_guard_disabled() == 1,
+          "false spelling disables the memory guard");
+    setenv("DS4_GLM_MEMORY_GUARD", "1", 1);
+    CHECK(ds4_test_glm_memory_guard_disabled() == 0,
+          "DS4_GLM_MEMORY_GUARD=1 keeps the guard enabled");
+    restore_env_value("DS4_GLM_MEMORY_GUARD", old_guard);
 }
 
 static void test_cuda_tp_prefill_default_accounting(void) {
@@ -677,6 +738,8 @@ int main(void) {
     test_pertier_overhead_pushes_to_spill();
     test_no_per_layer_scratch_double_count();
     test_glm_per_layer_cache_accounting();
+    test_glm_session_count_accounting();
+    test_glm_memory_guard_budget();
     test_cuda_tp_prefill_default_accounting();
     test_laguna_prefill_chunk_accounting();
     test_cuda_tp_output_head_moves_to_lower_half();

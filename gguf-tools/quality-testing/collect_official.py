@@ -235,6 +235,8 @@ def main() -> int:
     ap.add_argument("--allow-provider-fallbacks", action="store_true")
     ap.add_argument("--require-parameters", action="store_true",
                     help="for OpenRouter, route only to endpoints advertising the requested parameters")
+    ap.add_argument("--resume", action="store_true",
+                    help="reuse complete cases already present in the output directory")
     args = ap.parse_args()
     if args.top_logprobs < 0 or args.top_logprobs > 20:
         raise SystemExit("--top-logprobs must be between 0 and 20")
@@ -266,6 +268,8 @@ def main() -> int:
 
     manifest = out / "manifest.tsv"
     rows = []
+    observed_models = set()
+    observed_providers = set()
     total = min(args.count, len(prompts))
     print(f"model={args.model} endpoint={args.endpoint}", file=sys.stderr)
     print(f"key_env={api_key_env} token_field={token_limit_field} thinking={thinking} reasoning={reasoning_effort}",
@@ -277,48 +281,84 @@ def main() -> int:
     for i, prompt in enumerate(prompts[: args.count]):
         case_id = f"case_{i:03d}"
         print(f"official {i + 1}/{total}: {case_id}", file=sys.stderr, flush=True)
-        response = fetch_with_retry(
-            api_key,
-            args.endpoint,
-            args.model,
-            prompt,
-            args.max_tokens,
-            args.top_logprobs,
-            thinking,
-            reasoning_effort,
-            token_limit_field,
-            provider_order,
-            args.allow_provider_fallbacks,
-            provider_require_parameters,
-        )
+        prompt_path = out / "prompts" / f"{case_id}.txt"
+        cont_path = out / "continuations" / f"{case_id}.txt"
+        resp_path = out / "responses" / f"{case_id}.json"
+        complete = prompt_path.exists() and cont_path.exists() and resp_path.exists()
+        if args.resume and complete:
+            if prompt_path.read_text(encoding="utf-8") != prompt:
+                raise RuntimeError(f"{case_id}: saved prompt differs from current prompt set")
+            content = cont_path.read_text(encoding="utf-8")
+            response = json.loads(resp_path.read_text(encoding="utf-8"))
+            if not content:
+                complete = False
+
+        if not args.resume or not complete:
+            for empty_attempt in range(3):
+                response = fetch_with_retry(
+                    api_key,
+                    args.endpoint,
+                    args.model,
+                    prompt,
+                    args.max_tokens,
+                    args.top_logprobs,
+                    thinking,
+                    reasoning_effort,
+                    token_limit_field,
+                    provider_order,
+                    args.allow_provider_fallbacks,
+                    provider_require_parameters,
+                )
+                choice = response["choices"][0]
+                content = choice.get("message", {}).get("content")
+                if isinstance(content, str) and content:
+                    break
+                print(f"warning: empty continuation for {case_id}; retrying",
+                      file=sys.stderr, flush=True)
+                time.sleep(1.0 + empty_attempt)
+            else:
+                raise RuntimeError(f"{case_id}: provider returned three empty continuations")
         choice = response["choices"][0]
-        content = choice.get("message", {}).get("content", "")
-        if not content:
-            print(f"warning: empty continuation for {case_id}", file=sys.stderr)
+        if response.get("model"):
+            observed_models.add(response["model"])
+        if response.get("provider"):
+            observed_providers.add(response["provider"])
         logprob_items = (choice.get("logprobs") or {}).get("content", []) or []
         if args.top_logprobs > 0 and not logprob_items:
             raise RuntimeError(f"{case_id}: response did not include output-token logprobs")
 
-        prompt_path = out / "prompts" / f"{case_id}.txt"
-        cont_path = out / "continuations" / f"{case_id}.txt"
-        resp_path = out / "responses" / f"{case_id}.json"
-        prompt_path.write_text(prompt, encoding="utf-8")
-        cont_path.write_text(content, encoding="utf-8")
-        resp_path.write_text(json.dumps(response, ensure_ascii=False, indent=2), encoding="utf-8")
-        rows.append((case_id, prompt_path, cont_path,
-                     resp_path if args.top_logprobs > 0 else None))
+        if not args.resume or not complete:
+            prompt_path.write_text(prompt, encoding="utf-8")
+            cont_path.write_text(content, encoding="utf-8")
+            resp_path.write_text(json.dumps(response, ensure_ascii=False, indent=2), encoding="utf-8")
+        rows.append((case_id, prompt_path, cont_path, resp_path))
         time.sleep(0.05)
 
     with manifest.open("w", encoding="utf-8") as fp:
-        fp.write("# id\tprompt_file\tcontinuation_file")
-        if args.top_logprobs > 0:
-            fp.write("\tresponse_file")
-        fp.write("\n")
+        fp.write("# id\tprompt_file\tcontinuation_file\tresponse_file\n")
         for row in rows:
-            fields = [row[0], str(row[1]), str(row[2])]
-            if row[3] is not None:
-                fields.append(str(row[3]))
-            fp.write("\t".join(fields) + "\n")
+            fp.write("\t".join([row[0], str(row[1]), str(row[2]), str(row[3])]) + "\n")
+    collection = {
+        "schema": "ds4-official-continuations-v1",
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "model": args.model,
+        "endpoint": args.endpoint,
+        "observed_models": sorted(observed_models),
+        "observed_providers": sorted(observed_providers),
+        "temperature": 0,
+        "max_tokens": args.max_tokens,
+        "top_logprobs": args.top_logprobs,
+        "thinking": thinking,
+        "reasoning_effort": reasoning_effort,
+        "token_limit_field": token_limit_field,
+        "provider_order": provider_order,
+        "allow_provider_fallbacks": args.allow_provider_fallbacks,
+        "require_parameters": provider_require_parameters,
+        "case_count": len(rows),
+    }
+    (out / "collection.json").write_text(
+        json.dumps(collection, indent=2) + "\n", encoding="utf-8"
+    )
     print(f"wrote {manifest}", file=sys.stderr)
     return 0
 
