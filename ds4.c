@@ -58054,6 +58054,7 @@ static int generate_glm_metal_argmax(
 }
 #endif
 
+#ifndef DS4_NO_GPU
 /* Laguna has a conventional residual stream and KV cache, but alternates
  * full-attention and sliding-window layers with different query geometry.
  * Keep this graph separate from DeepSeek's compressed-attention graph and
@@ -58726,6 +58727,7 @@ static bool laguna_graph_forward_token(
     }
     return ok;
 }
+#endif
 
 static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, float *out);
 static void qwen4_ple_step(int token, int *prev, uint32_t *rows);
@@ -59810,6 +59812,7 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
 }
 #endif /* DS4_HAS_QWEN4_GPU */
 
+#ifndef DS4_NO_GPU
 static void laguna_graph_report_prefill_display_progress(
         ds4_session_progress_fn display_progress,
         void                   *display_progress_ud,
@@ -60392,6 +60395,7 @@ static int generate_laguna_metal_argmax(
     laguna_graph_free(&g);
     return ok ? 0 : 1;
 }
+#endif
 
 #ifdef DS4_HAS_QWEN4_GPU
 /* host side: embedding rows tiled into R and the PLE n-gram gather */
