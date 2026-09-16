@@ -260,6 +260,36 @@ __global__ static void glm53_rocm_matvec_bf16_f32_kernel(
     }
 }
 
+__global__ static void glm53_rocm_matvec_bf16_row_f32_kernel(
+        float *out,
+        const uint16_t *weights,
+        const float *x,
+        uint32_t in_dim,
+        uint32_t out_dim) {
+    const uint32_t col = blockIdx.x;
+    const uint32_t row = blockIdx.y;
+    if (col >= out_dim) return;
+    const uint16_t *wrow = weights + (uint64_t)col * in_dim;
+    const float *xrow = x + (uint64_t)row * in_dim;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        const float w = __uint_as_float((uint32_t)wrow[i] << 16);
+        sum = fmaf(w, xrow[i], sum);
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride != 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0u) {
+        out[(uint64_t)row * out_dim + col] = partial[0];
+    }
+}
+
 extern "C" int ds4_gpu_glm53_embedding_bf16(
         ds4_gpu_tensor       *out,
         const void           *model_map,
@@ -332,6 +362,15 @@ extern "C" int ds4_gpu_glm53_matmul_bf16(
         "GLM-5.3 BF16 matrix");
     if (!weights) return 0;
     if (n_rows <= 8u) {
+        if (out_dim <= 128u && in_dim >= 4096u &&
+            getenv("DS4_ROCM_GLM_DISABLE_BF16_ROW_MATVEC") == NULL) {
+            const dim3 row_grid(out_dim, n_rows, 1u);
+            glm53_rocm_matvec_bf16_row_f32_kernel<<<row_grid, 256u>>>(
+                (float *)out->ptr, (const uint16_t *)weights,
+                (const float *)x->ptr, in_dim, out_dim);
+            return cuda_ok(cudaGetLastError(),
+                           "GLM-5.3 BF16/F32 row matvec launch");
+        }
         const dim3 grid((out_dim + 7u) / 8u, n_rows, 1u);
         glm53_rocm_matvec_bf16_f32_kernel<<<grid, 256u>>>(
             (float *)out->ptr, (const uint16_t *)weights,
@@ -1071,6 +1110,7 @@ __global__ static void glm_store_indexer_k_kernel(
         __syncthreads();
     }
     const float mean = partial[0] / (float)head_dim;
+    __syncthreads();
     float ss = 0.0f;
     for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
         const float d = src[i] - mean;
@@ -1159,46 +1199,6 @@ __global__ static void glm_k_b_project_q8_0_head_kernel(
                    x[j];
         }
         dst[q] = acc;
-    }
-}
-
-__global__ static void glm_q8_project_rows_kernel(
-        float *out,
-        const unsigned char *weight,
-        const float *x,
-        uint32_t n_tokens,
-        uint32_t n_head,
-        uint32_t in_dim,
-        uint32_t out_dim,
-        uint32_t x_stride,
-        uint32_t x_head_stride,
-        uint32_t row_bytes) {
-    const uint32_t out_row = blockIdx.x;
-    const uint32_t token = blockIdx.y;
-    if (token >= n_tokens || out_row >= n_head * out_dim) return;
-    const uint32_t head = out_row / out_dim;
-    const uint32_t d = out_row - head * out_dim;
-    const float *xr = x + (uint64_t)token * x_stride + (uint64_t)head * x_head_stride;
-    const unsigned char *row = weight + ((uint64_t)head * out_dim + d) * row_bytes;
-    float acc = 0.0f;
-    const uint32_t blocks = (in_dim + 31u) >> 5u;
-    for (uint32_t b = threadIdx.x; b < blocks; b += blockDim.x) {
-        const uint32_t base = b << 5u;
-        const uint32_t count = min(32u, in_dim - base);
-        const unsigned char *blk = row + (uint64_t)b * 34u;
-        const float scale = q8_0_scale_scalar(blk);
-        const int8_t *qs = (const int8_t *)(blk + 2u);
-        for (uint32_t i = 0; i < count; i++) acc += scale * (float)qs[i] * xr[base + i];
-    }
-    __shared__ float partial[256];
-    partial[threadIdx.x] = acc;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0u) {
-        out[((uint64_t)token * n_head + head) * out_dim + d] = partial[0];
     }
 }
 
@@ -1362,6 +1362,7 @@ __global__ static void glm_attention_full_kernel(
         __syncthreads();
     }
     const float max_score = red[0];
+    __syncthreads();
     float local_sum = 0.0f;
     for (uint32_t row = threadIdx.x; row < visible; row += blockDim.x) {
         const float w = expf(scores[row] - max_score);
@@ -1719,6 +1720,7 @@ __global__ static void glm_attention_indexed_decode_split_partial_kernel(
         __syncthreads();
     }
     const float max_score = red[0];
+    __syncthreads();
     float *out = partial_lora + ((uint64_t)block * n_head + head) * kv_lora_dim;
     float *ms = partial_ms + ((uint64_t)block * n_head + head) * 2u;
     if (!isfinite(max_score)) {
@@ -1961,6 +1963,7 @@ __global__ static void glm_attention_indexed_decode_split_reduce_kernel(
         __syncthreads();
     }
     const float max_m = red[0];
+    __syncthreads();
     if (!isfinite(max_m)) {
         for (uint32_t d = threadIdx.x; d < value_dim; d += blockDim.x) {
             heads[(uint64_t)head * value_dim + d] = 0.0f;
@@ -2979,6 +2982,28 @@ extern "C" int ds4_gpu_glm_qk_lowrank_q8_0_tensor(
                                 "glm_qk_lowrank", &w, &row_bytes)) {
         return 0;
     }
+    const char *wave_decode_env =
+        getenv("DS4_ROCM_GLM_QK_LOW_WAVE_DECODE");
+    if (wave_decode_env == NULL || cuda_env_present(wave_decode_env)) {
+        const uint32_t threads = 256u;
+        const uint32_t waves_per_block = threads / 32u;
+        const dim3 grid((kv_lora_dim + waves_per_block - 1u) /
+                            waves_per_block,
+                        n_head,
+                        1u);
+        glm_q8_project_head_wave_kernel<<<grid, threads>>>(
+                (float *)qk_low->ptr,
+                w,
+                (const float *)q->ptr,
+                n_head,
+                qk_nope,
+                kv_lora_dim,
+                (uint32_t)x_stride64,
+                qk_dim,
+                row_bytes);
+        return cuda_ok(cudaGetLastError(),
+                       "glm wave-parallel qk lowrank launch");
+    }
     glm_q8_project_head_kernel<<<dim3(n_head, 1, 1), 256, (size_t)qk_nope * sizeof(float)>>>(
             (float *)qk_low->ptr,
             w,
@@ -3263,6 +3288,7 @@ __global__ static void glm_causal_gemm_softmax_f16_kernel(
         __syncthreads();
     }
     const float max_score = reduce[0];
+    __syncthreads();
     float sum = 0.0f;
     for (uint32_t s = threadIdx.x; s < n_selected; s += blockDim.x) {
         const float v = s < visible ? expf(row[s] - max_score) : 0.0f;
@@ -3380,8 +3406,10 @@ __global__ static void glm_selected_gemm_rope_to_f16_kernel(
 __global__ static void glm_selected_gemm_softmax_f16_kernel(
         __half *probs,
         float *scores,
+        const int32_t *selected,
         uint32_t n_tokens,
         uint32_t n_selected,
+        uint32_t cache_cap,
         float scale) {
     const uint32_t token = blockIdx.x;
     if (token >= n_tokens) return;
@@ -3389,7 +3417,9 @@ __global__ static void glm_selected_gemm_softmax_f16_kernel(
     __shared__ float reduce[256];
     float vmax = -INFINITY;
     for (uint32_t s = threadIdx.x; s < n_selected; s += blockDim.x) {
-        const float v = row[s] * scale;
+        const int32_t cache_row = selected[(uint64_t)token * n_selected + s];
+        const float v = cache_row >= 0 && (uint32_t)cache_row < cache_cap ?
+            row[s] * scale : -INFINITY;
         row[s] = v;
         vmax = fmaxf(vmax, v);
     }
@@ -3403,9 +3433,10 @@ __global__ static void glm_selected_gemm_softmax_f16_kernel(
         __syncthreads();
     }
     const float max_score = reduce[0];
+    __syncthreads();
     float sum = 0.0f;
     for (uint32_t s = threadIdx.x; s < n_selected; s += blockDim.x) {
-        const float v = expf(row[s] - max_score);
+        const float v = isfinite(max_score) ? expf(row[s] - max_score) : 0.0f;
         row[s] = v;
         sum += v;
     }
@@ -3478,8 +3509,10 @@ __global__ static void glm_selected_gemm_gather_heads_f16_kernel(
 __global__ static void glm_selected_gemm_softmax_heads_f16_kernel(
         __half *probs,
         float *scores,
+        const int32_t *selected,
         uint32_t n_tokens,
         uint32_t n_selected,
+        uint32_t cache_cap,
         uint32_t head_count,
         uint32_t head_capacity,
         float scale) {
@@ -3492,7 +3525,9 @@ __global__ static void glm_selected_gemm_softmax_heads_f16_kernel(
     __shared__ float reduce[256];
     float vmax = -INFINITY;
     for (uint32_t s = threadIdx.x; s < n_selected; s += blockDim.x) {
-        const float v = row[s] * scale;
+        const int32_t cache_row = selected[(uint64_t)token * n_selected + s];
+        const float v = cache_row >= 0 && (uint32_t)cache_row < cache_cap ?
+            row[s] * scale : -INFINITY;
         row[s] = v;
         vmax = fmaxf(vmax, v);
     }
@@ -3506,9 +3541,10 @@ __global__ static void glm_selected_gemm_softmax_heads_f16_kernel(
         __syncthreads();
     }
     const float max_score = reduce[0];
+    __syncthreads();
     float sum = 0.0f;
     for (uint32_t s = threadIdx.x; s < n_selected; s += blockDim.x) {
-        const float v = expf(row[s] - max_score);
+        const float v = isfinite(max_score) ? expf(row[s] - max_score) : 0.0f;
         row[s] = v;
         sum += v;
     }
@@ -3720,10 +3756,10 @@ static int glm_attention_indexed_lora_causal_gemm(
         float beta_fast,
         float beta_slow) {
     if (!g_cublas_ready || !lora_out || !q || !qk_low ||
-        !kv_lora_cache || !k_rope_cache ||
+        !kv_lora_cache || (qk_rope != 0u && !k_rope_cache) ||
         n_tokens < 256u || n_selected == 0u ||
         n_head == 0u || kv_lora_dim == 0u ||
-        qk_rope == 0u || (qk_rope & 1u) != 0u ||
+        (qk_rope & 1u) != 0u ||
         n_tokens > INT_MAX || n_selected > INT_MAX ||
         kv_lora_dim > INT_MAX || qk_rope > INT_MAX) {
         return 0;
@@ -3788,23 +3824,27 @@ static int glm_attention_indexed_lora_causal_gemm(
     if (!cuda_ok(cudaGetLastError(), "glm causal attention kv f16 launch")) {
         return 0;
     }
-    const uint64_t rope_pairs = (uint64_t)n_selected * (qk_rope >> 1u);
-    glm_causal_gemm_rope_to_f16_kernel<<<
-        (rope_pairs + 255u) / 256u, 256>>>(
-            rope_h,
-            (const char *)k_rope_cache->ptr,
-            n_selected,
-            qk_rope,
-            cache_f16,
-            n_ctx_orig,
-            freq_base,
-            freq_scale,
-            ext_factor,
-            attn_factor,
-            beta_fast,
-            beta_slow);
-    if (!cuda_ok(cudaGetLastError(), "glm causal attention rope f16 launch")) {
-        return 0;
+    if (qk_rope != 0u) {
+        const uint64_t rope_pairs =
+            (uint64_t)n_selected * (qk_rope >> 1u);
+        glm_causal_gemm_rope_to_f16_kernel<<<
+            (rope_pairs + 255u) / 256u, 256>>>(
+                rope_h,
+                (const char *)k_rope_cache->ptr,
+                n_selected,
+                qk_rope,
+                cache_f16,
+                n_ctx_orig,
+                freq_base,
+                freq_scale,
+                ext_factor,
+                attn_factor,
+                beta_fast,
+                beta_slow);
+        if (!cuda_ok(cudaGetLastError(),
+                     "glm causal attention rope f16 launch")) {
+            return 0;
+        }
     }
 
     const float one = 1.0f;
@@ -3851,27 +3891,29 @@ static int glm_attention_indexed_lora_causal_gemm(
         if (!cublas_ok(st, "glm causal attention lora score gemm")) {
             return 0;
         }
-        st = cublasGemmEx(g_cublas,
-                          CUBLAS_OP_T,
-                          CUBLAS_OP_N,
-                          (int)n_selected,
-                          (int)n_tokens,
-                          (int)qk_rope,
-                          &one,
-                          rope_h,
-                          CUDA_R_16F,
-                          (int)qk_rope,
-                          qrope_h,
-                          CUDA_R_16F,
-                          (int)qk_rope,
-                          &one,
-                          scores,
-                          CUDA_R_32F,
-                          (int)n_selected,
-                          CUBLAS_COMPUTE_32F,
-                          CUBLAS_GEMM_DEFAULT);
-        if (!cublas_ok(st, "glm causal attention rope score gemm")) {
-            return 0;
+        if (qk_rope != 0u) {
+            st = cublasGemmEx(g_cublas,
+                              CUBLAS_OP_T,
+                              CUBLAS_OP_N,
+                              (int)n_selected,
+                              (int)n_tokens,
+                              (int)qk_rope,
+                              &one,
+                              rope_h,
+                              CUDA_R_16F,
+                              (int)qk_rope,
+                              qrope_h,
+                              CUDA_R_16F,
+                              (int)qk_rope,
+                              &one,
+                              scores,
+                              CUDA_R_32F,
+                              (int)n_selected,
+                              CUBLAS_COMPUTE_32F,
+                              CUBLAS_GEMM_DEFAULT);
+            if (!cublas_ok(st, "glm causal attention rope score gemm")) {
+                return 0;
+            }
         }
         glm_causal_gemm_softmax_f16_kernel<<<n_tokens, 256>>>(
             probs, scores, n_tokens, n_selected, pos0, scale);
@@ -3937,11 +3979,11 @@ static int glm_attention_indexed_lora_selected_gemm(
         float beta_fast,
         float beta_slow) {
     if (!g_cublas_ready || !lora_out || !q || !qk_low ||
-        !kv_lora_cache || !k_rope_cache || !selected ||
+        !kv_lora_cache || (qk_rope != 0u && !k_rope_cache) || !selected ||
         n_tokens < 64u || n_tokens > 256u ||
         n_selected == 0u || n_selected > cache_cap ||
         n_head == 0u || kv_lora_dim == 0u ||
-        qk_rope == 0u || (qk_rope & 1u) != 0u ||
+        (qk_rope & 1u) != 0u ||
         n_tokens > INT_MAX || n_selected > INT_MAX ||
         kv_lora_dim > INT_MAX || qk_rope > INT_MAX) {
         return 0;
@@ -4038,32 +4080,34 @@ static int glm_attention_indexed_lora_selected_gemm(
     }
     glm_selected_gemm_profile_end(
         &profile, GLM_SELECTED_PROFILE_KV_GATHER);
-    const uint64_t rope_pairs = selected_rows * (qk_rope >> 1u);
-    const uint32_t rope_blocks =
-        (uint32_t)min((rope_pairs + 255u) / 256u, 4096ull);
-    glm_selected_gemm_profile_begin(&profile);
-    glm_selected_gemm_rope_to_f16_kernel<<<rope_blocks, 256>>>(
-        rope_h,
-        (const char *)k_rope_cache->ptr,
-        (const int32_t *)selected->ptr,
-        n_tokens,
-        n_selected,
-        qk_rope,
-        cache_cap,
-        cache_f16,
-        n_ctx_orig,
-        freq_base,
-        freq_scale,
-        ext_factor,
-        attn_factor,
-        beta_fast,
-        beta_slow);
-    if (!cuda_ok(cudaGetLastError(),
-                 "glm selected attention rope gather launch")) {
-        return 0;
+    if (qk_rope != 0u) {
+        const uint64_t rope_pairs = selected_rows * (qk_rope >> 1u);
+        const uint32_t rope_blocks =
+            (uint32_t)min((rope_pairs + 255u) / 256u, 4096ull);
+        glm_selected_gemm_profile_begin(&profile);
+        glm_selected_gemm_rope_to_f16_kernel<<<rope_blocks, 256>>>(
+            rope_h,
+            (const char *)k_rope_cache->ptr,
+            (const int32_t *)selected->ptr,
+            n_tokens,
+            n_selected,
+            qk_rope,
+            cache_cap,
+            cache_f16,
+            n_ctx_orig,
+            freq_base,
+            freq_scale,
+            ext_factor,
+            attn_factor,
+            beta_fast,
+            beta_slow);
+        if (!cuda_ok(cudaGetLastError(),
+                     "glm selected attention rope gather launch")) {
+            return 0;
+        }
+        glm_selected_gemm_profile_end(
+            &profile, GLM_SELECTED_PROFILE_ROPE_GATHER);
     }
-    glm_selected_gemm_profile_end(
-        &profile, GLM_SELECTED_PROFILE_ROPE_GATHER);
 
     const float one = 1.0f;
     const float zero = 0.0f;
@@ -4146,48 +4190,53 @@ static int glm_attention_indexed_lora_selected_gemm(
         }
         glm_selected_gemm_profile_end(
             &profile, GLM_SELECTED_PROFILE_LORA_SCORE);
-        glm_selected_gemm_profile_begin(&profile);
-        st = cublasGemmStridedBatchedEx(
-            g_cublas,
-            CUBLAS_OP_T,
-            CUBLAS_OP_N,
-            (int)n_selected,
-            (int)tile_heads,
-            (int)qk_rope,
-            &one,
-            rope_h,
-            CUDA_R_16F,
-            (int)qk_rope,
-            rope_stride,
-            qrope_h,
-            CUDA_R_16F,
-            (int)qk_rope,
-            qrope_stride,
-            &one,
-            scores,
-            CUDA_R_32F,
-            (int)n_selected,
-            score_stride,
-            (int)n_tokens,
-            CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT);
-        if (!cublas_ok(st, "glm selected attention rope score gemm")) {
-            return 0;
+        if (qk_rope != 0u) {
+            glm_selected_gemm_profile_begin(&profile);
+            st = cublasGemmStridedBatchedEx(
+                g_cublas,
+                CUBLAS_OP_T,
+                CUBLAS_OP_N,
+                (int)n_selected,
+                (int)tile_heads,
+                (int)qk_rope,
+                &one,
+                rope_h,
+                CUDA_R_16F,
+                (int)qk_rope,
+                rope_stride,
+                qrope_h,
+                CUDA_R_16F,
+                (int)qk_rope,
+                qrope_stride,
+                &one,
+                scores,
+                CUDA_R_32F,
+                (int)n_selected,
+                score_stride,
+                (int)n_tokens,
+                CUBLAS_COMPUTE_32F,
+                CUBLAS_GEMM_DEFAULT);
+            if (!cublas_ok(st, "glm selected attention rope score gemm")) {
+                return 0;
+            }
+            glm_selected_gemm_profile_end(
+                &profile, GLM_SELECTED_PROFILE_ROPE_SCORE);
         }
-        glm_selected_gemm_profile_end(
-            &profile, GLM_SELECTED_PROFILE_ROPE_SCORE);
         glm_selected_gemm_profile_begin(&profile);
         if (head_tile == 1u) {
             glm_selected_gemm_softmax_f16_kernel<<<n_tokens, 256>>>(
-                probs, scores, n_tokens, n_selected, scale);
+                probs, scores, (const int32_t *)selected->ptr,
+                n_tokens, n_selected, cache_cap, scale);
         } else {
             const dim3 softmax_grid(n_tokens, tile_heads, 1u);
             glm_selected_gemm_softmax_heads_f16_kernel<<<
                 softmax_grid, 256>>>(
                     probs,
                     scores,
+                    (const int32_t *)selected->ptr,
                     n_tokens,
                     n_selected,
+                    cache_cap,
                     tile_heads,
                     head_tile,
                     scale);

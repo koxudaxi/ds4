@@ -289,7 +289,12 @@ class TensorPlan:
 
 
 class SourceDB:
-    def __init__(self, hf_dir, index_validator=validate_glm53_index):
+    def __init__(
+        self,
+        hf_dir,
+        index_validator=validate_glm53_index,
+        scale_validator=validate_fp8_scales,
+    ):
         self.hf_dir = hf_dir
         index_path = os.path.join(hf_dir, "model.safetensors.index.json")
         document, self.weight_map = load_index(index_path)
@@ -313,7 +318,7 @@ class SourceDB:
         if set(self.tensors) != set(self.weight_map):
             missing = sorted(set(self.weight_map) - set(self.tensors))
             fail(f"source headers are incomplete; first missing tensor is {missing[0]}")
-        validate_fp8_scales(self.tensors)
+        scale_validator(self.tensors)
 
     def info(self, name):
         try:
@@ -908,7 +913,7 @@ def tensor_header(item):
     )
 
 
-def print_plan(plan, kv_records, tokenizer_records):
+def print_plan(plan, kv_records, tokenizer_records, alignment=GGUF_ALIGNMENT):
     by_type = {}
     by_role = {}
     for item in plan:
@@ -916,8 +921,8 @@ def print_plan(plan, kv_records, tokenizer_records):
         by_role[item.role] = by_role.get(item.role, 0) + item.nbytes
     kv_bytes = sum(map(len, kv_records)) + sum(map(len, tokenizer_records))
     tensor_info_bytes = sum(len(tensor_header(item)) for item in plan)
-    data_offset = align(4 + 4 + 8 + 8 + kv_bytes + tensor_info_bytes)
-    data_bytes = sum(align(item.nbytes) for item in plan)
+    data_offset = align(4 + 4 + 8 + 8 + kv_bytes + tensor_info_bytes, alignment)
+    data_bytes = sum(align(item.nbytes, alignment) for item in plan)
     print(f"tensors: {len(plan)}")
     print(f"metadata_records: {len(kv_records) + len(tokenizer_records)}")
     print(f"metadata_bytes: {data_offset}")

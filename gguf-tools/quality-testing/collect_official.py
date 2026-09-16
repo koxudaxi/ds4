@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -134,13 +135,17 @@ def request_one(
     provider_order: list[str],
     provider_allow_fallbacks: bool,
     provider_require_parameters: bool,
+    temperature: float = 0,
+    system: str | None = None,
 ) -> dict:
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,
+        "temperature": temperature,
         "stream": False,
     }
+    if system is not None:
+        payload["messages"].insert(0, {"role": "system", "content": system})
     if top_logprobs > 0:
         payload["logprobs"] = True
         payload["top_logprobs"] = top_logprobs
@@ -181,6 +186,8 @@ def fetch_with_retry(
     provider_order: list[str],
     provider_allow_fallbacks: bool,
     provider_require_parameters: bool,
+    temperature: float = 0,
+    system: str | None = None,
 ) -> dict:
     delay = 1.0
     for attempt in range(6):
@@ -198,6 +205,8 @@ def fetch_with_retry(
                 provider_order,
                 provider_allow_fallbacks,
                 provider_require_parameters,
+                temperature,
+                system,
             )
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", "replace")
@@ -218,11 +227,17 @@ def main() -> int:
     ap.add_argument("--out", default="gguf-tools/quality-testing/data")
     ap.add_argument("--prompts", default="gguf-tools/quality-testing/prompts.jsonl")
     ap.add_argument("--model", default=MODEL)
+    ap.add_argument("--system", default=None,
+                    help="explicit system message, including an empty string; "
+                         "some providers insert a default when this is omitted")
     ap.add_argument("--endpoint", default=ENDPOINT)
     ap.add_argument("--api-key-env", default=None)
     ap.add_argument("--count", type=int, default=100)
     ap.add_argument("--max-tokens", type=int, default=24)
     ap.add_argument("--top-logprobs", type=int, default=5)
+    ap.add_argument("--temperature", type=float, default=0,
+                    help="sampling temperature, 0..2; use 1 for unscaled logprobs "
+                         "from providers reporting probabilities after sampling transforms")
     ap.add_argument("--thinking", choices=("disabled", "enabled", "omit"), default="disabled")
     ap.add_argument("--reasoning-effort",
                     choices=("xhigh", "high", "medium", "low", "minimal", "none", "omit"),
@@ -235,11 +250,17 @@ def main() -> int:
     ap.add_argument("--allow-provider-fallbacks", action="store_true")
     ap.add_argument("--require-parameters", action="store_true",
                     help="for OpenRouter, route only to endpoints advertising the requested parameters")
+    ap.add_argument("--require-response-model",
+                    help="reject a response that reports a different model ID")
+    ap.add_argument("--require-response-provider",
+                    help="reject a response from a different provider")
     ap.add_argument("--resume", action="store_true",
                     help="reuse complete cases already present in the output directory")
     args = ap.parse_args()
     if args.top_logprobs < 0 or args.top_logprobs > 20:
         raise SystemExit("--top-logprobs must be between 0 and 20")
+    if not math.isfinite(args.temperature) or not 0 <= args.temperature <= 2:
+        raise SystemExit("--temperature must be between 0 and 2")
 
     openrouter = "openrouter.ai" in args.endpoint
     api_key_env = args.api_key_env or ("OPENROUTER_API_KEY" if openrouter else "DEEPSEEK_API_KEY")
@@ -265,6 +286,12 @@ def main() -> int:
     (out / "prompts").mkdir(parents=True, exist_ok=True)
     (out / "continuations").mkdir(parents=True, exist_ok=True)
     (out / "responses").mkdir(parents=True, exist_ok=True)
+    system_path = out / "request_system.json"
+    if args.resume and (system_path.exists() or any((out / "responses").glob("*.json"))):
+        saved_system = json.loads(system_path.read_text()) if system_path.exists() else None
+        if saved_system != args.system:
+            raise RuntimeError("saved system message differs from --system; use a new output directory")
+    system_path.write_text(json.dumps(args.system, ensure_ascii=False) + "\n", encoding="utf-8")
 
     manifest = out / "manifest.tsv"
     rows = []
@@ -308,6 +335,8 @@ def main() -> int:
                     provider_order,
                     args.allow_provider_fallbacks,
                     provider_require_parameters,
+                    args.temperature,
+                    args.system,
                 )
                 choice = response["choices"][0]
                 content = choice.get("message", {}).get("content")
@@ -319,6 +348,19 @@ def main() -> int:
             else:
                 raise RuntimeError(f"{case_id}: provider returned three empty continuations")
         choice = response["choices"][0]
+        if (args.require_response_model and
+                response.get("model") != args.require_response_model):
+            raise RuntimeError(
+                f"{case_id}: expected model {args.require_response_model!r}, "
+                f"got {response.get('model')!r}"
+            )
+        if (args.require_response_provider and
+                response.get("provider") != args.require_response_provider):
+            raise RuntimeError(
+                f"{case_id}: expected provider "
+                f"{args.require_response_provider!r}, got "
+                f"{response.get('provider')!r}"
+            )
         if response.get("model"):
             observed_models.add(response["model"])
         if response.get("provider"):
@@ -342,10 +384,11 @@ def main() -> int:
         "schema": "ds4-official-continuations-v1",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "model": args.model,
+        "system": args.system,
         "endpoint": args.endpoint,
         "observed_models": sorted(observed_models),
         "observed_providers": sorted(observed_providers),
-        "temperature": 0,
+        "temperature": args.temperature,
         "max_tokens": args.max_tokens,
         "top_logprobs": args.top_logprobs,
         "thinking": thinking,
@@ -354,6 +397,8 @@ def main() -> int:
         "provider_order": provider_order,
         "allow_provider_fallbacks": args.allow_provider_fallbacks,
         "require_parameters": provider_require_parameters,
+        "required_response_model": args.require_response_model,
+        "required_response_provider": args.require_response_provider,
         "case_count": len(rows),
     }
     (out / "collection.json").write_text(
