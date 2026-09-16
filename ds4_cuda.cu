@@ -34034,11 +34034,6 @@ extern "C" int ds4_gpu_tp_big_gate_wait(uint64_t seq) {
     return 0;
 }
 
-extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
-    (void)layer; (void)rows;
-    return 0;
-}
-
 extern "C" int ds4_gpu_matmul_q6_K_tensor(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
