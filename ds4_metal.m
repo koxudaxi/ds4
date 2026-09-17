@@ -18156,8 +18156,11 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                         ds4_gpu_now_ms() - buffer_t0);
             }
             if (!prepared) {
-                ok = 0;
-                break;
+                /* Budget/allocation failure for this expert: leave it uncached
+                 * and let the view-served path below address it. Aborting the
+                 * whole batch here is what made a low mlock ceiling a prefill
+                 * failure (P18). */
+                continue;
             }
             if (!force_reuse && reserved_entries < UINT32_MAX) {
                 reserved_entries++;
