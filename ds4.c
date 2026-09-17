@@ -72970,7 +72970,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
-        if (e->ssd_streaming && DS4_MODEL_VARIANT != DS4_VARIANT_LAGUNA_XS21) {
+        if (e->ssd_streaming && DS4_MODEL_VARIANT != DS4_VARIANT_LAGUNA_XS21 &&
+            DS4_MODEL_VARIANT != DS4_VARIANT_LAGUNA_S21) {
             fprintf(stderr,
                     "ds4: --ssd-streaming for Laguna is only supported "
                     "for Laguna XS 2.1\n");
@@ -72988,7 +72989,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
         if (opt->prefill_chunk != 0 &&
-            DS4_MODEL_VARIANT != DS4_VARIANT_LAGUNA_XS21) {
+            DS4_MODEL_VARIANT != DS4_VARIANT_LAGUNA_XS21 &&
+            DS4_MODEL_VARIANT != DS4_VARIANT_LAGUNA_S21) {
             fprintf(stderr,
                     "ds4: --prefill-chunk for Laguna is only supported "
                     "for Laguna XS 2.1\n");
