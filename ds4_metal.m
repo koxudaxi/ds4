@@ -16409,6 +16409,9 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
         if (ds4_gpu_stream_expert_cache_on_service_thread()) return 0;
         if (!ds4_gpu_stream_expert_cache_wait_inflight(
                 "streaming expert cache replacement")) {
+            fprintf(stderr,
+                    "ds4: [probe p18-layer40] prepare_load_buffers: wait_inflight failed layer=%u expert=%u\n",
+                    (unsigned)layer, (unsigned)expert);
             return 0;
         }
         e = &g_stream_expert_cache[layer][expert];
@@ -16465,11 +16468,18 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
             return 0;
         }
         if (g_stream_expert_cache_mlock_budget_cap != 0) {
-            return ds4_gpu_stream_expert_cache_take_capped_reusable(
+            const int capped_rc = ds4_gpu_stream_expert_cache_take_capped_reusable(
                     protect_layer, protect_ids, n_protect,
                     gate_expert_bytes, down_expert_bytes,
                     gate_buf, up_buf, down_buf,
                     gate_inner, up_inner, down_inner);
+            if (!capped_rc) {
+                fprintf(stderr,
+                        "ds4: [probe p18-layer40] prepare_load_buffers: capped_reusable(pre-slab) failed layer=%u expert=%u cap=%llu\n",
+                        (unsigned)layer, (unsigned)expert,
+                        (unsigned long long)g_stream_expert_cache_mlock_budget_cap);
+            }
+            return capped_rc;
         }
         if (ds4_gpu_stream_expert_alloc_slab_slot(gate_expert_bytes,
                                                   down_expert_bytes,
@@ -16482,11 +16492,18 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
             return 1;
         }
         if (g_stream_expert_cache_mlock_budget_cap != 0) {
-            return ds4_gpu_stream_expert_cache_take_capped_reusable(
+            const int capped_rc = ds4_gpu_stream_expert_cache_take_capped_reusable(
                     protect_layer, protect_ids, n_protect,
                     gate_expert_bytes, down_expert_bytes,
                     gate_buf, up_buf, down_buf,
                     gate_inner, up_inner, down_inner);
+            if (!capped_rc) {
+                fprintf(stderr,
+                        "ds4: [probe p18-layer40] prepare_load_buffers: capped_reusable(post-slab) failed layer=%u expert=%u cap=%llu\n",
+                        (unsigned)layer, (unsigned)expert,
+                        (unsigned long long)g_stream_expert_cache_mlock_budget_cap);
+            }
+            return capped_rc;
         }
         const uint64_t up_off = gate_expert_bytes;
         const uint64_t down_off = gate_expert_bytes * 2ull;
@@ -18356,6 +18373,9 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
     free(ids);
 
     if (!ok || (*n_resources == 0 && view_served == 0)) {
+        fprintf(stderr,
+                "ds4: [probe p18-layer40] prepare_selected_batch: no resources/view (ok=%d n_resources=%u view_served=%u layer=%u)\n",
+                ok, (unsigned)*n_resources, (unsigned)view_served, (unsigned)layer);
         ds4_gpu_stream_expert_cache_clear_layer(layer);
         return 0;
     }
@@ -18363,6 +18383,9 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                                                   gate_addrs,
                                                   up_addrs,
                                                   down_addrs)) {
+        fprintf(stderr,
+                "ds4: [probe p18-layer40] prepare_selected_batch: ensure_addr_buffers failed layer=%u\n",
+                (unsigned)layer);
         ds4_gpu_stream_expert_cache_clear_layer(layer);
         return 0;
     }
@@ -42037,6 +42060,9 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
                 return 0;
             }
             if (stream_unique == 0) {
+                fprintf(stderr,
+                        "ds4: [probe p18-layer40] batch impl: stream_unique==0 layer=%u resource_count=%u\n",
+                        (unsigned)layer_index, (unsigned)stream_resource_count);
                 ds4_gpu_stream_expert_cache_clear_layer(layer_index);
                 return 0;
             }
@@ -42202,6 +42228,9 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
             !ds4_gpu_stream_expert_cache_mark_entries_inflight(stream_resources,
                                                                stream_resource_count,
                                                                0)) {
+            fprintf(stderr,
+                    "ds4: [probe p18-layer40] batch impl: mark_entries_inflight failed layer=%u count=%u\n",
+                    (unsigned)layer_index, (unsigned)stream_resource_count);
             return 0;
         }
 
