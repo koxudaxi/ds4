@@ -16392,6 +16392,9 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
         !gate_inner || !up_inner || !down_inner ||
         layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
         expert >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
+        fprintf(stderr,
+                "ds4: [probe p18-layer40] prepare_load_buffers: validation return 0 (layer=%u expert=%u)\n",
+                (unsigned)layer, (unsigned)expert);
         return 0;
     }
 
@@ -16406,7 +16409,12 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
     ds4_gpu_stream_expert_cache_entry *e =
         &g_stream_expert_cache[layer][expert];
     if (e->valid && ds4_gpu_stream_expert_cache_entry_inflight(e)) {
-        if (ds4_gpu_stream_expert_cache_on_service_thread()) return 0;
+        if (ds4_gpu_stream_expert_cache_on_service_thread()) {
+            fprintf(stderr,
+                    "ds4: [probe p18-layer40] prepare_load_buffers: service-thread return 0 (layer=%u expert=%u)\n",
+                    (unsigned)layer, (unsigned)expert);
+            return 0;
+        }
         if (!ds4_gpu_stream_expert_cache_wait_inflight(
                 "streaming expert cache replacement")) {
             fprintf(stderr,
@@ -16465,6 +16473,9 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
             gate_expert_bytes * 2ull > (uint64_t)NSUIntegerMax ||
             gate_expert_bytes * 2ull + down_expert_bytes >
                 (uint64_t)NSUIntegerMax) {
+            fprintf(stderr,
+                    "ds4: [probe p18-layer40] prepare_load_buffers: size-overflow return 0 (layer=%u expert=%u)\n",
+                    (unsigned)layer, (unsigned)expert);
             return 0;
         }
         if (g_stream_expert_cache_mlock_budget_cap != 0) {
@@ -16512,11 +16523,17 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
             ds4_gpu_stream_expert_alloc_buffer(combined_bytes,
                                                @"ds4_stream_expert_combined");
         if (!combined) {
-            return ds4_gpu_stream_expert_cache_take_capped_reusable(
+            const int capped_rc = ds4_gpu_stream_expert_cache_take_capped_reusable(
                     protect_layer, protect_ids, n_protect,
                     gate_expert_bytes, down_expert_bytes,
                     gate_buf, up_buf, down_buf,
                     gate_inner, up_inner, down_inner);
+            if (!capped_rc) {
+                fprintf(stderr,
+                        "ds4: [probe p18-layer40] prepare_load_buffers: combined alloc failed -> capped 0 (layer=%u expert=%u)\n",
+                        (unsigned)layer, (unsigned)expert);
+            }
+            return capped_rc;
         }
         *gate_buf = combined;
         *up_buf = combined;
@@ -16540,11 +16557,17 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
         ds4_gpu_stream_expert_unlock_explicit_buffer(explicit_gate);
         ds4_gpu_stream_expert_unlock_explicit_buffer(explicit_up);
         ds4_gpu_stream_expert_unlock_explicit_buffer(explicit_down);
-        return ds4_gpu_stream_expert_cache_take_capped_reusable(
+        const int capped_rc = ds4_gpu_stream_expert_cache_take_capped_reusable(
                 protect_layer, protect_ids, n_protect,
                 gate_expert_bytes, down_expert_bytes,
                 gate_buf, up_buf, down_buf,
                 gate_inner, up_inner, down_inner);
+        if (!capped_rc) {
+            fprintf(stderr,
+                    "ds4: [probe p18-layer40] prepare_load_buffers: explicit alloc failed -> capped 0 (layer=%u expert=%u)\n",
+                    (unsigned)layer, (unsigned)expert);
+        }
+        return capped_rc;
     }
     *gate_buf = explicit_gate;
     *up_buf = explicit_up;
@@ -18173,6 +18196,9 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                         ds4_gpu_now_ms() - buffer_t0);
             }
             if (!prepared) {
+                fprintf(stderr,
+                        "ds4: [probe p18-layer40] ok=0: prepare_load_buffers returned 0 (layer=%u expert=%u)\n",
+                        (unsigned)layer, (unsigned)expert);
                 ok = 0;
                 break;
             }
@@ -18182,6 +18208,9 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
             if (!gate_bufs[n_loads] ||
                 !up_bufs[n_loads] ||
                 !down_bufs[n_loads]) {
+                fprintf(stderr,
+                        "ds4: [probe p18-layer40] ok=0: null load buffers (layer=%u expert=%u)\n",
+                        (unsigned)layer, (unsigned)expert);
                 ok = 0;
                 break;
             }
@@ -18193,6 +18222,9 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
             uint8_t *down_dst = (uint8_t *)[down_bufs[n_loads] contents] +
                                  down_inners[n_loads];
             if (!gate_dst || !up_dst || !down_dst) {
+                fprintf(stderr,
+                        "ds4: [probe p18-layer40] ok=0: null buffer contents (layer=%u expert=%u)\n",
+                        (unsigned)layer, (unsigned)expert);
                 ok = 0;
                 break;
             }
@@ -18234,6 +18266,11 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                                                n_tasks,
                                                &read_bytes,
                                                &read_ms);
+        if (!ok) {
+            fprintf(stderr,
+                    "ds4: [probe p18-layer40] ok=0: pread_tasks failed (layer=%u loads=%u tasks=%u)\n",
+                    (unsigned)layer, (unsigned)n_loads, (unsigned)n_tasks);
+        }
         if (ok) {
             ds4_gpu_stream_expert_cache_note_pread(layer, read_bytes, read_ms);
         }
@@ -18272,6 +18309,9 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                                                                up_inners[load_i],
                                                                down_inners[load_i]);
                 if (!entry) {
+                    fprintf(stderr,
+                            "ds4: [probe p18-layer40] ok=0: install_loaded returned NULL (layer=%u expert=%u)\n",
+                            (unsigned)layer, (unsigned)expert);
                     ok = 0;
                     break;
                 }
@@ -18340,6 +18380,9 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                             (NSUInteger)(overflow_up_inner + gate_rel),
                             *overflow_down,
                             (NSUInteger)(overflow_down_inner + down_rel))) {
+                    fprintf(stderr,
+                            "ds4: [probe p18-layer40] ok=0: set_addr_slot failed (layer=%u expert=%u)\n",
+                            (unsigned)layer, (unsigned)expert);
                     ok = 0;
                     break;
                 }
