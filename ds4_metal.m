@@ -41921,11 +41921,15 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
             !gate_pair_q2 && !gate_pair_q5 && down_scalar_q4 &&
             g_glm_q4_k_addr_pair_swiglu_f32_pipeline != nil &&
             g_glm_q4_k_addr_down_f32_pipeline != nil;
+        const BOOL stream_addr_q3 =
+            gate_pair_q3 && down_simd_q3 &&
+            g_glm_q3_k_addr_pair_swiglu_f32_pipeline != nil &&
+            g_glm_q3_k_addr_down_f32_pipeline != nil;
         BOOL use_stream_expert_addr_table =
             g_ssd_streaming_mode &&
             !ds4_gpu_glm_streaming_prefill_full_layer_active() &&
             n_tokens > 1 &&
-            (stream_addr_q2 || stream_addr_q4) &&
+            (stream_addr_q2 || stream_addr_q3 || stream_addr_q4) &&
             layer_index < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER &&
             n_total_expert <= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT &&
             n_expert <= DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED &&
@@ -41936,6 +41940,7 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
                                                       n_expert) != 0;
         const BOOL use_stream_grouped_addr_table =
             use_stream_expert_addr_table &&
+            !stream_addr_q3 &&
             allow_grouped &&
             getenv("DS4_METAL_GLM_DISABLE_STREAMING_GROUPED_ADDR_PREFILL") == NULL &&
             ds4_gpu_glm_routed_moe_batch_grouped_available(gate_type,
@@ -41954,6 +41959,9 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
              (gate_pair_q2 ?
               ds4_gpu_hot_pipeline(g_glm_q2_k_addr_pair_swiglu2_f32_pipeline,
                                    "kernel_glm_q2_K_addr_pair_swiglu2_f32") :
+              gate_pair_q3 ?
+              ds4_gpu_hot_pipeline(g_glm_q3_k_addr_pair_swiglu_f32_pipeline,
+                                   "kernel_glm_q3_K_addr_pair_swiglu_f32") :
               ds4_gpu_hot_pipeline(g_glm_q4_k_addr_pair_swiglu_f32_pipeline,
                                    "kernel_glm_q4_K_addr_pair_swiglu_f32")) :
             gate_pair_q2 ?
@@ -41978,6 +41986,9 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
              (down_scalar_q2 ?
               ds4_gpu_hot_pipeline(g_glm_q2_k_addr_down_f32_pipeline,
                                    "kernel_glm_q2_K_addr_down_f32") :
+              down_simd_q3 ?
+              ds4_gpu_hot_pipeline(g_glm_q3_k_addr_down_f32_pipeline,
+                                   "kernel_glm_q3_K_addr_down_f32") :
               ds4_gpu_hot_pipeline(g_glm_q4_k_addr_down_f32_pipeline,
                                    "kernel_glm_q4_K_addr_down_f32")) :
             down_scalar_q2 ?
