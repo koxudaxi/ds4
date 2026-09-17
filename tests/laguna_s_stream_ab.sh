@@ -39,6 +39,14 @@ if pgrep -x ds4 >/dev/null 2>&1 || pgrep -x ds4_test >/dev/null 2>&1; then
   exit 1
 fi
 
+# A CPU `ds4` (left by `make cpu`, which check-engine runs) carries none of the
+# Metal/Laguna symbols and would silently decode on the CPU, so an A/B run
+# against it proves nothing. Refuse a non-Metal binary outright.
+if ! nm ds4 2>/dev/null | grep -q ds4_gpu_laguna_qk_head_rms_norm_rope_tensor; then
+  echo "S stream A/B: ds4 is not a Metal build; run 'make ds4' in external/ds4" >&2
+  exit 1
+fi
+
 PROMPTS=(
   "def fizzbuzz(n):"
   "<html><head><title>"
