@@ -964,7 +964,10 @@ static uint32_t g_model_view_count;
 enum {
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER = 80,
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT = 384,
-    DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED = DS4_METAL_MAX_ROUTED_EXPERT_USED,
+    /* 16: Laguna S 2.1 selects 10 experts/token; XS selects 8. Keep this
+     * independent of DS4_METAL_MAX_ROUTED_EXPERT_USED (8), which caps the
+     * ds4_gpu_routed_moe_one_tensor group paths and must not widen. */
+    DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED = 16u,
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES =
         DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER *
         DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT,
@@ -39777,20 +39780,20 @@ int ds4_gpu_glm_routed_moe_one_tensor(
             (stream_addr_q2 || stream_addr_q4 || stream_addr_q3) &&
             layer_index < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER &&
             n_total_expert <= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT &&
-            n_expert <= 8u &&
+            n_expert <= DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED &&
             ds4_gpu_stream_expert_cache_configured_budget() >= n_expert &&
             ds4_gpu_stream_expert_cache_note_expert_size(gate_expert_bytes,
                                                          down_expert_bytes) &&
             ds4_gpu_stream_expert_cache_effective_cap(layer_index,
                                                       n_total_expert,
                                                       n_expert) != 0;
-        int32_t stream_selected_ids[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        ds4_gpu_stream_expert_cache_entry *stream_entries[8] = {
-            NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+        int32_t stream_selected_ids[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED] = {0};
+        ds4_gpu_stream_expert_cache_entry *stream_entries[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED] = {
+            NULL
         };
-        uint64_t stream_gate_abs_offsets[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        uint64_t stream_up_abs_offsets[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        uint64_t stream_down_abs_offsets[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        uint64_t stream_gate_abs_offsets[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED] = {0};
+        uint64_t stream_up_abs_offsets[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED] = {0};
+        uint64_t stream_down_abs_offsets[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED] = {0};
         uint32_t stream_missing_mask = 0;
         uint32_t stream_entry_count = 0;
         uint32_t stream_resident_mask = 0;
