@@ -124,6 +124,13 @@ tests/test_metal_stream_spans: tests/test_metal_stream_spans.m $(CORE_OBJS)
 test-metal-stream-spans: tests/test_metal_stream_spans
 	./tests/test_metal_stream_spans
 
+tests/test_laguna_kv_ring: tests/test_laguna_kv_ring.c ds4_gpu.h $(CORE_OBJS)
+	$(CC) $(CFLAGS) -fno-fast-math -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
+
+.PHONY: test-laguna-kv-ring
+test-laguna-kv-ring: tests/test_laguna_kv_ring
+	./tests/test_laguna_kv_ring
+
 tests/test_laguna_stream_session: tests/test_laguna_stream_session.c ds4.h $(CORE_OBJS)
 	$(CC) $(CFLAGS) -fno-fast-math -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
 

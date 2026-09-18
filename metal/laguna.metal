@@ -609,6 +609,10 @@ kernel void kernel_laguna_commit_kv_f16(
     if (gid >= values) return;
     const uint token = gid / width;
     const uint col = gid - token * width;
+    // A batch can exceed the sliding cache capacity. Only its newest rows
+    // survive after prefill; older rows would race with their replacements
+    // at the same ring address. Attention has already consumed staged KV.
+    if (args.n_tokens - token > args.cache_cap) return;
     const uint cache_row = (args.pos0 + token) % args.cache_cap;
     const uint64_t dst = (uint64_t)cache_row * width + col;
     key_cache[dst] = staged_key[gid];
