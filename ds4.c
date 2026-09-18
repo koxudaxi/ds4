@@ -58064,11 +58064,7 @@ typedef struct {
     uint32_t prefill_cap;
     uint64_t scratch_bytes;
     uint64_t kv_bytes;
-    /* Recorded at alloc time; not currently consumed here (both prefill and
-     * decode unconditionally (re)install the static decode span set below,
-     * which is a cheap no-op once the map already covers it -- see
-     * laguna_graph_forward_token / laguna_graph_forward_batch). Kept for
-     * visibility/future use rather than threading it back out. */
+    /* Streaming prefill maps only the current layer. */
     bool     ssd_streaming;
 
     ds4_gpu_tensor *tokens;
@@ -58313,7 +58309,7 @@ static bool laguna_graph_forward_token(
      * (non-streaming) mode the whole file is already mapped, so this is a
      * cheap no-op (ds4_gpu_model_views_cover_spans short-circuits). */
     ds4_model_map_span_vec laguna_decode_spans;
-    if (weights_model_map_decode_static_spans(weights, true, true,
+    if (weights_model_map_decode_runtime_spans(weights, true, true,
                                               &laguna_decode_spans)) {
         const bool spans_ok = metal_graph_install_model_spans(
                 model, &laguna_decode_spans, "Laguna static decode");
@@ -59852,21 +59848,12 @@ static bool laguna_graph_forward_batch(
         return false;
     }
 
-    /* Unlike decode's ds4_gpu_laguna_routed_shared_moe_one_tensor (which has
-     * a streaming address-table path), the batch routed-MoE kernel used
-     * below (ds4_gpu_glm_routed_moe_batch_tensor) always wraps the WHOLE
-     * routed-expert tensor from the mapped model range -- it ignores its own
-     * force_resident argument. So prefill needs every layer's routed
-     * experts resident, not just the decode-narrowed set that
-     * laguna_graph_forward_token installs. This widens back out to the full
-     * per-layer span set (a no-op in resident mode, same short-circuit as
-     * forward_token). Laguna does not implement GLM's windowed
-     * partial-resident prefill (deferred perf work); this is simpler and
-     * always correct, at the cost of prefill needing the whole file mapped
-     * while streaming. */
+    /* Batch routed kernels need full expert tensors, including off-cache
+     * layers. Bound their Metal views to one completed layer at a time so
+     * a command buffer never retains wrappers spanning the whole model. */
     {
         ds4_model_map_span_vec laguna_prefill_spans;
-        if (!weights_model_map_spans(weights, 0, DS4_N_LAYER - 1u, true,
+        if (!weights_model_map_spans(weights, 0, g->ssd_streaming ? 0 : DS4_N_LAYER - 1u, true,
                                      &laguna_prefill_spans)) {
             return false;
         }
@@ -59926,6 +59913,21 @@ static bool laguna_graph_forward_batch(
     uint32_t completed_layers = 0;
     const char *failed_stage = "embedding";
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        if (g->ssd_streaming && il > 0) {
+            /* Commands retain the prior layer's buffers until completion. */
+            ok = ds4_gpu_end_commands() != 0;
+            ds4_model_map_span_vec layer_spans;
+            if (ok) {
+                ok = weights_model_map_spans(weights, il, il, true, &layer_spans);
+                if (ok) {
+                    ok = metal_graph_install_model_spans(model, &layer_spans,
+                                                          "Laguna prefill layer");
+                    free(layer_spans.v);
+                }
+            }
+            if (ok) ok = ds4_gpu_begin_commands() != 0;
+            if (!ok) { failed_stage = "layer mapping"; break; }
+        }
         const ds4_layer_weights *l = &weights->layer[il];
         const uint32_t n_head = ds4_layer_head_count(il);
         const bool is_swa = ds4_laguna_layer_is_swa(il);

@@ -117,6 +117,29 @@ tests/test_metal_session_batch.o: tests/test_metal_session_batch.c ds4.h
 tests/test_metal_session_batch: tests/test_metal_session_batch.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
+tests/test_metal_stream_spans: tests/test_metal_stream_spans.m $(CORE_OBJS)
+	$(CC) $(OBJCFLAGS) -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
+
+.PHONY: test-metal-stream-spans
+test-metal-stream-spans: tests/test_metal_stream_spans
+	./tests/test_metal_stream_spans
+
+tests/test_laguna_stream_session: tests/test_laguna_stream_session.c ds4.h $(CORE_OBJS)
+	$(CC) $(CFLAGS) -fno-fast-math -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
+
+.PHONY: test-laguna-stream-session
+test-laguna-stream-session: tests/test_laguna_stream_session
+	./tests/test_laguna_stream_session "$(DS4_TEST_MODEL)"
+
+# Model-backed, opt-in: never included in the default test target.
+tests/test_laguna_stream_token_start: tests/test_laguna_stream_token_start.c ds4.h $(CORE_OBJS)
+	$(CC) $(CFLAGS) -fno-fast-math -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
+
+.PHONY: test-laguna-stream-token-start
+test-laguna-stream-token-start: tests/test_laguna_stream_token_start
+	@test -n "$(DS4_TEST_MODEL)" || (echo "Set DS4_TEST_MODEL to a Laguna GGUF"; exit 2)
+	./tests/test_laguna_stream_token_start "$(DS4_TEST_MODEL)"
+
 tests/test_metal_tp_spec.o: tests/test_metal_tp_spec.c ds4.h ds4_tp.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 

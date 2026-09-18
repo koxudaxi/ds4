@@ -960,6 +960,14 @@ typedef struct {
 
 static ds4_gpu_model_view g_model_views[DS4_METAL_MAX_MODEL_VIEWS];
 static uint32_t g_model_view_count;
+/* Streaming requests replace the active set, including when it shrinks.
+ * Remember the request, not individual view coverage: large tensors may be
+ * split across overlapping views. Every view mutation invalidates this key. */
+static const void *g_span_request_map;
+static uint64_t g_span_request_size, g_span_request_max_tensor;
+static uint32_t g_span_request_count;
+static uint64_t g_span_request_offsets[DS4_METAL_MAX_MODEL_VIEWS];
+static uint64_t g_span_request_sizes[DS4_METAL_MAX_MODEL_VIEWS];
 
 enum {
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER = 80,
@@ -2104,6 +2112,7 @@ static void ds4_gpu_progress_failed(void) {
 }
 
 static void ds4_gpu_model_views_clear(void) {
+    g_span_request_count = 0;
     for (uint32_t i = 0; i < g_model_view_count; i++) {
         g_model_views[i].buffer = nil;
         g_model_views[i].model_map = NULL;
@@ -2115,6 +2124,7 @@ static void ds4_gpu_model_views_clear(void) {
 }
 
 static void ds4_gpu_model_views_remove_map(const void *model_map) {
+    g_span_request_count = 0;
     uint32_t kept = 0;
     for (uint32_t i = 0; i < g_model_view_count; i++) {
         if (g_model_views[i].model_map != model_map)
@@ -2210,6 +2220,7 @@ static int ds4_gpu_add_model_view_range(
         uint64_t    max_tensor_bytes,
         bool        use_default_view_cap,
         uint64_t   *mapped_model_size_out) {
+    g_span_request_count = 0;
     const uint64_t page = (uint64_t)getpagesize();
     const uintptr_t model_addr = (uintptr_t)model_map;
 
@@ -4704,6 +4715,7 @@ void ds4_gpu_set_glm_model(bool enabled) {
 }
 
 void ds4_gpu_set_ssd_streaming(bool enabled) {
+    g_span_request_count = 0;
     g_ssd_streaming_mode = enabled ? 1 : 0;
     ds4_gpu_stream_expert_cache_clear_all(1);
     if (g_ssd_streaming_mode) {
@@ -13270,7 +13282,14 @@ int ds4_gpu_set_model_map_spans(
                                            sizes[0],
                                            max_tensor_bytes);
     }
-    if (ds4_gpu_model_views_cover_spans(model_map, model_size, offsets, sizes, count)) {
+    const uint64_t requested_max_tensor = max_tensor_bytes;
+    if (g_ssd_streaming_mode && count == g_span_request_count &&
+        model_map == g_span_request_map && model_size == g_span_request_size &&
+        requested_max_tensor == g_span_request_max_tensor &&
+        memcmp(offsets, g_span_request_offsets, count * sizeof(*offsets)) == 0 &&
+        memcmp(sizes, g_span_request_sizes, count * sizeof(*sizes)) == 0) return 1;
+    if (!g_ssd_streaming_mode &&
+        ds4_gpu_model_views_cover_spans(model_map, model_size, offsets, sizes, count)) {
         return 1;
     }
 
@@ -13313,6 +13332,14 @@ int ds4_gpu_set_model_map_spans(
             ds4_gpu_model_residency_clear();
             ds4_gpu_model_views_clear();
             return 0;
+        }
+        if (g_ssd_streaming_mode && count <= DS4_METAL_MAX_MODEL_VIEWS) {
+            memcpy(g_span_request_offsets, offsets, count * sizeof(*offsets));
+            memcpy(g_span_request_sizes, sizes, count * sizeof(*sizes));
+            g_span_request_map = model_map;
+            g_span_request_size = model_size;
+            g_span_request_max_tensor = requested_max_tensor;
+            g_span_request_count = count;
         }
         g_model_map_ptr = model_map;
         g_model_map_size = model_size;
