@@ -33,7 +33,7 @@ int main(int argc,char **argv) {
         }
         puts(""); fflush(stdout);
         if(turn<2) {
-            ds4_chat_append_message(e,&prompt,"user",turn==0 ? "Now subtract 1 from that result." : "日本語で答えてください。");
+            ds4_chat_append_message(e,&prompt,"user",turn==0 ? "Now subtract 1 from that result." : "Explain your answer briefly.");
             ds4_chat_append_think_prefix(e,&prompt,DS4_THINK_NONE);
             CHECK(ds4_session_sync(s,&prompt,error,sizeof(error))==0);
         }
@@ -49,7 +49,7 @@ int main(int argc,char **argv) {
     CHECK(finite_argmax(s,logits,vocab)==next);
     ds4_session_snapshot_free(&snap);
     ds4_tokens_free(&prompt);
-    ds4_encode_chat_prompt(e,NULL,"Say hello in Japanese.",DS4_THINK_NONE,&prompt);
+    ds4_encode_chat_prompt(e,NULL,"Say hello briefly.",DS4_THINK_NONE,&prompt);
     ds4_session_set_cancel(s,cancel_now,NULL);
     CHECK(ds4_session_sync(s,&prompt,error,sizeof(error))==DS4_SESSION_SYNC_INTERRUPTED);
     ds4_session_set_cancel(s,NULL,NULL);
