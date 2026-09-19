@@ -131,6 +131,7 @@ tests/test_laguna_mixed_prefill: tests/test_laguna_mixed_prefill.c ds4_gpu.h $(C
 .PHONY: test-laguna-mixed-prefill
 test-laguna-mixed-prefill: tests/test_laguna_mixed_prefill
 	./tests/test_laguna_mixed_prefill
+	./tests/test_laguna_mixed_prefill --large-activations
 
 tests/test_laguna_kv_ring: tests/test_laguna_kv_ring.c ds4_gpu.h $(CORE_OBJS)
 	$(CC) $(CFLAGS) -fno-fast-math -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)

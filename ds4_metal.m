@@ -41210,7 +41210,11 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
         return 0;
     }
 
-    const bool mid_f16 = true;
+    /* Unclamped Laguna activations can exceed FP16 even for finite inputs.
+     * Q6 down must consume FP32 directly; F32 storage alone is insufficient
+     * because the grouped down kernel stages its RHS in half precision. */
+    const bool q6_f32_down = down_type == DS4_METAL_TENSOR_Q6_K && swiglu_clamp == 0.0f;
+    const bool mid_f16 = !q6_f32_down;
     const NSUInteger mm_id_threadgroup_bytes = 8192u;
     const uint64_t compact_mid_values = (uint64_t)pair_rows * expert_mid_dim;
     const uint64_t down_values = (uint64_t)pair_rows * out_dim;
@@ -41423,6 +41427,32 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
                                                    mid_f16);
         }
         DS4_METAL_PROFILE_GLM_GROUPED_MOE_STAGE("activation_weight");
+        if (q6_f32_down) {
+            ds4_gpu_glm_routed_moe_args args = {
+                .tp_rank = g_tp_split_rank, .tp_world = g_tp_split_world,
+                .tp_expert_base = (int32_t)first_expert,
+                .in_dim = expert_in_dim, .mid_dim = expert_mid_dim,
+                .out_dim = out_dim, .n_total_expert = n_total_expert,
+                .n_expert_used = n_expert, .n_tokens = n_tokens,
+                .mid_token_stride = n_expert * expert_mid_dim,
+                .down_type = down_type,
+                .down_expert_bytes = down_expert_bytes,
+                .down_row_bytes = down_row_bytes,
+            };
+            if (!ok || !g_glm_q6_k_down_f32_pipeline) return 0;
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:g_glm_q6_k_down_f32_pipeline];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:downbuf offset:(NSUInteger)down_inner atIndex:1];
+            [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:2];
+            [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:3];
+            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake((out_dim + 3u) / 4u, n_tokens, 1)
+                 threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+            return ds4_gpu_finish_command_buffer(cb, owned, "GLM grouped Q6 FP32 down");
+        }
+
 
         id<MTLBuffer> down_dst = n_expert == 1 ? outbuf : g_moe_down_scratch_buffer;
         NSUInteger down_dst_off = n_expert == 1 ? ds4_gpu_tensor_offset(out) : 0;
