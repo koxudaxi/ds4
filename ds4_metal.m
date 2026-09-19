@@ -41825,8 +41825,16 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
         return 0;
     }
 
+    /* XS Q4_K_M uses Q6_K down projections. The batched cache-address
+     * path cannot serve that layout and already falls back to mapped weights.
+     * Keep the resident grouped arithmetic for this fallback: selecting the
+     * scalar kernels only because streaming is enabled changes F16 staging
+     * and therefore the model's logits. The caller maps this layer's tensors. */
+    const bool mapped_q4_q6 = gate_type == DS4_METAL_TENSOR_Q4_K &&
+                              up_type == DS4_METAL_TENSOR_Q4_K &&
+                              down_type == DS4_METAL_TENSOR_Q6_K;
     if (allow_grouped &&
-        (!g_ssd_streaming_mode ||
+        (!g_ssd_streaming_mode || mapped_q4_q6 ||
          ds4_gpu_glm_streaming_prefill_full_layer_active()) &&
         ds4_gpu_glm_grouped_moe_layer_enabled(layer_index) &&
         ds4_gpu_glm_routed_moe_batch_grouped_available(gate_type,
